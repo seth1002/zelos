@@ -141,3 +141,36 @@ class STAT64(ctypes.Structure):
         # ('__unused4', ctypes.c_uint32),
         # ('__unused5', ctypes.c_uint32),
     ]
+
+
+class STATFS(ctypes.Structure):
+    # This is intended for 64 bit architectures.
+    # https://github.com/torvalds/linux/blob/master/include/uapi/asm-generic/stat.h
+    _fields_ = [
+        ("f_type", ctypes.c_uint32),  # integer vector describing variable */
+        ("f_bsize", ctypes.c_uint32),  # length of this vector */
+        ("f_blocks", ctypes.c_uint32),
+        (
+            "f_bfree",
+            ctypes.c_uint32,
+        ),  # 0 or address where to store old value */
+        ("f_bavail", ctypes.c_uint32),
+        ("f_files", ctypes.c_uint32),
+        ("f_ffree", ctypes.c_uint32),
+        ("f_fsid", ctypes.c_uint32),
+        ("f_namelen", ctypes.c_uint32),
+        ("f_frsize", ctypes.c_int32),
+        ("f_flags", ctypes.c_uint32),
+        ("f_spare", ctypes.c_uint32),
+    ]
+
+
+class MMAP_ARG_STRUCT32(ctypes.Structure):
+    _fields_ = [
+        ("addr", ctypes.c_uint32),
+        ("length", ctypes.c_uint32),
+        ("prot", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("fd", ctypes.c_uint32),
+        ("offset", ctypes.c_uint32),
+    ]

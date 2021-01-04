@@ -14,12 +14,14 @@
 # License along with this program.  If not, see
 # <http://www.gnu.org/licenses/>.
 # ======================================================================
+
+import functools
 import logging
 
 from collections import defaultdict
 from typing import Any, Callable, Optional
 
-import unicorn as uc
+import zebracorn as uc
 
 from zelos.enums import HookType
 from zelos.exceptions import InvalidHookTypeException, ZelosRuntimeException
@@ -54,7 +56,7 @@ class HookInfo:
         return hook_string
 
 
-def _zelos_hook_to_unicorn(hook_type):
+def _zelos_hook_to_zebracorn(hook_type):
     return {
         HookType.MEMORY.READ: uc.UC_HOOK_MEM_READ,
         HookType.MEMORY.WRITE: uc.UC_HOOK_MEM_WRITE,
@@ -93,6 +95,24 @@ class HookManager:
         self._hooks = defaultdict(dict)
 
         self._cross_process_hooks = {}
+
+        # Used to keep track of hook deletions that need to occur once
+        # zebracorn is done running (since they can't safely occur while
+        # zebracorn is running).
+        self._to_delete_closures = []
+
+        # Kernel hooks are used to track memory reads and writes that
+        # are done by Zelos. However, memory initialization is not
+        # interesting in that sense. We only turn on kernel_hooks after
+        # initialization has been completed.
+        self._internal_mem_hooks_enabled = False
+
+        # In order to use function hooks, we need to know the base
+        # address of the target module. This is not immediately
+        # available for dynamic binaries. We will wait for the first
+        # time the target binary is mapped into memory.
+        self._func_hooks_enabled = False
+        self._func_hooks_to_register = []
 
     def register_mem_hook(
         self,
@@ -134,10 +154,15 @@ class HookManager:
 
         """
 
+        if self.is_internal_mem_hook(hook_type):
+            return self._register_zelos_mem_hook(
+                hook_type, callback, mem_low, mem_high, name, end_condition
+            )
+
         def memhook_wrapper(uc, access, address, size, value, user_data):
             return callback(self.api, access, address, size, value)
 
-        return self._add_unicorn_hook(
+        return self._add_zebracorn_hook(
             hook_type,
             memhook_wrapper,
             name,
@@ -145,6 +170,31 @@ class HookManager:
             mem_high,
             end_condition=end_condition,
         )
+
+    def _register_zelos_mem_hook(
+        self, hook_type, callback, mem_low, mem_high, name, end_condition
+    ) -> HookInfo:
+        """
+        Used to hook memory reads and writes that are done by Zelos.
+        """
+
+        def zelos_memhook_wrapper(access, address, size, value):
+            nonlocal hook_info
+            try:
+                if mem_low is not None and address + size <= mem_low:
+                    return
+                if mem_high is not None and address > mem_high:
+                    return
+                callback(self.api, access, address, size, value)
+                if end_condition is not None and end_condition():
+                    self.delete_hook(hook_info)
+            except Exception as e:
+                self.logger.exception(f"Error running mem hook: {e}")
+
+        hook_info = self._add_zelos_hook(
+            hook_type, zelos_memhook_wrapper, name
+        )
+        return hook_info
 
     def register_exec_hook(
         self,
@@ -188,7 +238,7 @@ class HookManager:
         def exechook_wrapper(uc, address, size, user_data):
             return callback(self.api, address, size)
 
-        return self._add_unicorn_hook(
+        return self._add_zebracorn_hook(
             hook_type,
             exechook_wrapper,
             name,
@@ -225,7 +275,7 @@ class HookManager:
         def insttype_hook_wrapper(uc, user_data):
             return callback(self.api)
 
-        return self._add_unicorn_hook(
+        return self._add_zebracorn_hook(
             inst_type,
             insttype_hook_wrapper,
             name=name,
@@ -234,13 +284,157 @@ class HookManager:
         )
 
     def register_syscall_hook(
-        self, syscall_hook_type, callback, name=None
+        self, syscall_hook_type, callback, name=None, syscall_name=None
     ) -> HookInfo:
+        if syscall_name is not None:
+
+            def syscall_callback_wrapper(zelos, sysname, args, retval):
+                if sysname == syscall_name:
+                    return callback(zelos, sysname, args, retval)
+
+            return self._add_zelos_hook(
+                syscall_hook_type, syscall_callback_wrapper, name
+            )
         return self._add_zelos_hook(syscall_hook_type, callback, name)
+
+    def setup_func_hooks(self):
+        """
+        This function must be called before function hooks are enabled.
+        It can only be called once the addresses of the imported
+        functions are known.
+        """
+        self._func_hooks_enabled = True
+        for registration_callback in self._func_hooks_to_register:
+            registration_callback()
+        self._func_hooks_to_register = None
+
+    def on_entrypoint(self, callback):
+        """
+        Run callback when the binary has reached it's entrypoint for
+        the first time.
+        """
+
+        def register_on_entrypoint_hook():
+            entrypoint = self._rebase_target_module_addr(
+                self.z.main_module._target_entrypoint
+            )
+
+            def exec_callback_wrapper(*args):
+                self.logger.info(f"Reached entrypoint 0x{entrypoint:x}")
+                callback()
+
+            self.register_exec_hook(
+                HookType.EXEC.BLOCK,
+                exec_callback_wrapper,
+                ip_low=entrypoint,
+                ip_high=entrypoint,
+                name="on_entrypoint",
+                end_condition=lambda: True,
+            )
+
+        self.on_main_module_load(register_on_entrypoint_hook)
+
+    def on_main_module_load(self, callback):
+        """
+        Run callback when the first part of the target module has been
+        loaded into memory.
+        """
+        base_address = self.z.memory.get_module_base(self.z.target_binary_path)
+        if base_address is not None:
+            callback()
+            return
+
+        # Wait for the main module to be loaded before setting up the
+        # function hooks
+        def main_module_is_loaded():
+            base_address = self.z.memory.get_module_base(
+                self.z.target_binary_path
+            )
+            return base_address is not None
+
+        def delayed_func_hook_setup(zelos, access, address, size, data):
+            if main_module_is_loaded():
+                callback()
+
+        self.register_mem_hook(
+            HookType.MEMORY.INTERNAL_MAP,
+            delayed_func_hook_setup,
+            name="on_main_module_load",
+            end_condition=main_module_is_loaded,
+        )
+
+    def _rebase_target_module_addr(self, addr: int):
+        """
+        Takes an address with the target binary's image base and
+        rebases it to the address that it was actually loaded at.
+        """
+        return (
+            addr
+            - self.z.main_module._target_imagebase
+            + self.z.memory.get_module_base(self.z.target_binary_path)
+        )
+
+    def register_func_hook(
+        self,
+        func_name: str,
+        callback: Callable[["Zelos"], Any],
+        end_condition=None,
+    ) -> HookInfo:
+        """
+        Registers a hook that should execute when an imported function
+        is called.
+
+        There are multiple assumptions embedded in this hook.
+        We assume that the pointers to the imported functions will be
+        set at the time the entrypoint is reached. There are certain
+        protections that can be put in place that will get around this,
+        and we may have to update how function hooks are registered for
+        those binaries.
+        """
+        address_ptr = self.z.main_module._elf_dynamic_import_addrs.get(
+            func_name, None
+        )
+        if address_ptr is None:
+            return None
+
+        if not self._func_hooks_enabled:
+            registration_callback = functools.partial(
+                self.register_func_hook,
+                func_name,
+                callback,
+                end_condition=end_condition,
+            )
+            self._func_hooks_to_register.append(registration_callback)
+            return
+
+        address_ptr = self._rebase_target_module_addr(address_ptr)
+
+        func_addr = self.z.memory.read_int(address_ptr)
+
+        def read_wrapper(z, address, size):
+            callback(z)
+
+        return self.register_exec_hook(
+            HookType.EXEC.BLOCK,
+            read_wrapper,
+            ip_low=func_addr,
+            ip_high=func_addr,
+            name=f"func_{func_name}",
+            end_condition=end_condition,
+        )
 
     def register_exception_hook(self, callback, name=None) -> HookInfo:
         self.z.exception_handler.register_exception_handler(callback)
         return HookInfo(HookType._OTHER.EXCEPTION, callback, None, name)
+
+    def register_zml_hook(
+        self, zml_string: str, closure: Callable[[], Any], name=None
+    ) -> HookInfo:
+        """
+        Registers a hook that is triggered when a zml string is
+        satisfied.
+        """
+        return self.z.zml_parser.trigger_on_zml(closure, zml_string)
 
     def register_close_hook(
         self, closure: Callable[[], Any], name=None
@@ -257,13 +451,20 @@ class HookManager:
 
     def delete_hook(self, hook_info: HookInfo) -> None:
         """
-        Deletes a hook
+        Deletes a hook. Keep in mind that deletion is slightly delayed.
+        If you delete a hook before it has run on the current address,
+        the hook will still run.
 
         Args:
             hook_info:
         """
-        if self._is_unicorn_hook(hook_info.type):
-            self._delete_unicorn_hook(hook_info.handle)
+        if self.z.emu.is_running:
+            closure = functools.partial(self.delete_hook, hook_info)
+            self._stop_to_delete_hook(closure)
+            return
+
+        if self._is_zebracorn_hook(hook_info.type):
+            self._delete_zebracorn_hook(hook_info.handle)
         else:
             try:
                 del self._hooks[hook_info.type][hook_info.handle]
@@ -273,21 +474,54 @@ class HookManager:
                     f"hook type {hook_info.type}"
                 )
 
-    def _delete_unicorn_hook(self, handle):
-        for p in self.z.processes.process_list:
-            p.hooks._delete_unicorn_hook(handle)
+    def _stop_to_delete_hook(self, closure):
+        self._to_delete_closures.append(closure)
+        self.z.scheduler.stop_and_exec("delete hook", lambda: True)
 
-    def _is_unicorn_hook(self, hook_type):
-        if isinstance(
-            hook_type, (HookType.MEMORY, HookType.EXEC)
-        ) or hook_type in [HookType._OTHER.INTERRUPT]:
+    def _clear_deleted_hooks(self):
+        """
+        Removes hooks that were deleted while running zelos.
+        """
+        if self.z.emu.is_running:
+            self.logger.critical(
+                "Attempting to clear hooks while zebracorn is running. "
+                "You might have a bad time."
+            )
+        for closure in self._to_delete_closures:
+            closure()
+        self._to_delete_closures.clear()
+
+    def _delete_zebracorn_hook(self, handle):
+        """
+        Deleting zebracorn hooks can cause issues if done while zebracorn
+        is running. To get around this, we should register the deletions
+        and then stop zebracorn to trigger them.
+        """
+        if self.z.emu.is_running:
+            closure = functools.partial(self._delete_zebracorn_hook, handle)
+            self._stop_to_delete_hook(closure)
+            return
+        del self._cross_process_hooks[handle]
+        for p in self.z.processes.process_list:
+            p.hooks._delete_zebracorn_hook(handle)
+
+    def _is_zebracorn_hook(self, hook_type):
+        if isinstance(hook_type, HookType.MEMORY):
+            if self.is_internal_mem_hook(hook_type):
+                return False
             return True
-        elif isinstance(
+
+        if isinstance(hook_type, HookType.EXEC) or hook_type in [
+            HookType._OTHER.INTERRUPT
+        ]:
+            return True
+
+        if isinstance(
             hook_type, (HookType.PROCESS, HookType.THREAD, HookType.SYSCALL)
         ) or hook_type in [HookType._OTHER.CLOSE]:
             return False
         raise Exception(
-            f"Unsure whether {hook_type} is a type of unicorn hook."
+            f"Unsure whether {hook_type} is a type of zebracorn hook."
         )
         return False
 
@@ -297,7 +531,35 @@ class HookManager:
         self._hook_index += 1
         return hook_info
 
-    def _add_unicorn_hook(
+    def _wrap_callback(self, name, callback, handle, end_condition):
+        """
+        Incorporates the self deletion triggered by the end_condition
+        into the callback.
+        """
+        # TODO(v): Make this function generic so non-zebracorn hooks can
+        # also have an end condition argument.
+        done = False
+
+        def wrapper(*args):
+            nonlocal done
+            if done:
+                self.logger.error(f"Attempted to run deleted hook {name}.")
+                return
+            try:
+                callback(*args)
+                if end_condition():
+                    done = True
+                    self._delete_zebracorn_hook(handle)
+            except Exception:
+                self.logger.exception(
+                    f"Hook {name} failed to execute. Deleting now"
+                )
+                done = True
+                self._delete_zebracorn_hook(handle)
+
+        return wrapper
+
+    def _add_zebracorn_hook(
         self,
         hook_type,
         callback,
@@ -308,7 +570,7 @@ class HookManager:
     ) -> HookInfo:
         """
         A cross process hook must accept a process as the first
-        argument, followed by the arguments expected by a unicorn hook
+        argument, followed by the arguments expected by a zebracorn hook
         of the given hook_type.
         """
         handle = self._hook_index
@@ -317,19 +579,9 @@ class HookManager:
             wrapped_callback = callback
         else:
             name = f"{name}_{start_addr}"
-
-            def hook_end_wrapper(*args):
-                try:
-                    callback(*args)
-                    if end_condition():
-                        self._delete_unicorn_hook(handle)
-                except Exception:
-                    self.logger.exception(
-                        "Hook %s failed to execute. Deleting now", name
-                    )
-                    self._delete_unicorn_hook(handle)
-
-            wrapped_callback = hook_end_wrapper
+            wrapped_callback = self._wrap_callback(
+                name, callback, handle, end_condition
+            )
 
         if hasattr(self.z, "processes"):
             for p in self.z.processes.process_list:
@@ -342,7 +594,7 @@ class HookManager:
                     end_addr=end_addr,
                 )
 
-        self._cross_process_hooks[name] = HookInfo(
+        self._cross_process_hooks[handle] = HookInfo(
             hook_type,
             wrapped_callback,
             handle,
@@ -352,18 +604,35 @@ class HookManager:
             end_condition,
         )
 
-        return self._cross_process_hooks[name]
+        return self._cross_process_hooks[handle]
+
+    def is_internal_mem_hook(self, hook_type):
+        return hook_type in [
+            HookType.MEMORY.INTERNAL_READ,
+            HookType.MEMORY.INTERNAL_WRITE,
+            HookType.MEMORY.INTERNAL_MAP,
+        ]
 
     def _get_hooks(self, hook_type):
-        return self._hooks[hook_type].values()
+        if (
+            self.is_internal_mem_hook(hook_type)
+            and not self._internal_mem_hooks_enabled
+        ):
+            return []
+        # Hooks might delete themselves, can't iterate over the values
+        # if they are editing the underlying dictionary.
+        return list(self._hooks[hook_type].values())
+
+    def _enable_internal_memory_hooks(self):
+        self._internal_mem_hooks_enabled = True
 
 
 class Hooks:
     """ Keeps track of the hooks that are in action."""
 
-    def __init__(self, emu, threads):
+    def __init__(self, emu, scheduler):
         self.emu = emu
-        self.threads = threads
+        self.scheduler = scheduler
         self.logger = logging.getLogger(__name__)
 
         # Used for hooks that will be active until a user deactivates.
@@ -397,32 +666,44 @@ class Hooks:
         end_addr=None,
     ) -> None:
         """
-        Adds a hook to unicorn. Depending on the hook type, the callback
+        Adds a hook to zebracorn. Depending on the hook type, the callback
         is triggered at different moments, such as on ever instruction
         or every basic block. In addition, if you specify an address
         region, the hook will only run on those addresses. Restricting
         the addresses that a hook can trigger can result in considerable
         speedups.
         """
+        if self.emu.is_running:
+            add_hook_callback = functools.partial(
+                self.add_hook,
+                zelos_hook_type,
+                callback,
+                handle,
+                name=name,
+                start_addr=start_addr,
+                end_addr=end_addr,
+            )
+            self.scheduler.stop_and_exec("add_hook", add_hook_callback)
+            return
         if isinstance(zelos_hook_type, HookType._INST):
-            unicorn_hook_type = uc.UC_HOOK_INSN
-            arg1 = _zelos_hook_to_unicorn(zelos_hook_type)
+            zebracorn_hook_type = uc.UC_HOOK_INSN
+            arg1 = _zelos_hook_to_zebracorn(zelos_hook_type)
         else:
-            unicorn_hook_type = _zelos_hook_to_unicorn(zelos_hook_type)
+            zebracorn_hook_type = _zelos_hook_to_zebracorn(zelos_hook_type)
             arg1 = 0
 
         try:
             if start_addr is not None:
-                unicorn_handle = self.emu.hook_add(
-                    unicorn_hook_type,
+                zebracorn_handle = self.emu.hook_add(
+                    zebracorn_hook_type,
                     callback,
                     begin=start_addr,
                     end=end_addr,
                     arg1=arg1,
                 )
             else:
-                unicorn_handle = self.emu.hook_add(
-                    unicorn_hook_type, callback, arg1=arg1
+                zebracorn_handle = self.emu.hook_add(
+                    zebracorn_hook_type, callback, arg1=arg1
                 )
 
         except uc.UcError:
@@ -431,25 +712,23 @@ class Hooks:
                 f"type {zelos_hook_type}, arg1 {arg1}"
             )
 
-        self._hook_dict[handle] = unicorn_handle
+        self._hook_dict[handle] = zebracorn_handle
 
-    def _delete_unicorn_hook(self, zelos_handle):
-        unicorn_handle = self._hook_dict[zelos_handle]
+    def _delete_zebracorn_hook(self, zelos_handle):
         if self.emu.is_running:
-
-            def cleanup():
-                self.emu.hook_del(unicorn_handle)
-
-            self.threads.scheduler.stop_and_exec("cleanup hooks", cleanup)
-        else:
-            self.emu.hook_del(unicorn_handle)
+            self.logger.critical(
+                "Attempting to delete hooks while zebracorn is running. "
+                "You might have a bad time."
+            )
+        zebracorn_handle = self._hook_dict[zelos_handle]
+        self.emu.hook_del(zebracorn_handle)
 
     def del_hook(self, name):
         if name not in self._hook_dict:
             self.logger.notice("No hook with name %s" % name)
             return
         handle = self._hook_dict.pop(name)
-        self._delete_unicorn_hook(handle)
+        self._delete_zebracorn_hook(handle)
 
     def print_active_hooks(self):
         print("Permanent Hooks:")
@@ -494,7 +773,7 @@ class InterruptHooks:
         def interrupt_hook_wrapper(uc, intno, userdata):
             self._hook_interrupt(self._z.api, intno)
 
-        hook_info = self.hook_manager._add_unicorn_hook(
+        hook_info = self.hook_manager._add_zebracorn_hook(
             HookType._OTHER.INTERRUPT,
             interrupt_hook_wrapper,
             name="interrupt_hook",
@@ -523,11 +802,8 @@ class InterruptHooks:
             )
             return
 
-        address = zelos.regs.getIP()
-
         self.logger.spam(
-            f"Got interrupt {intno:x} at 0x{address:x} "
-            f"on thread {zelos.thread.name}"
+            f"Got interrupt 0x{intno:x} on thread {zelos.thread.name}"
         )
 
         handler = self.interrupt_handlers.get(intno, None)

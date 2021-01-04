@@ -15,17 +15,15 @@
 # <http://www.gnu.org/licenses/>.
 # ======================================================================
 
-import functools
 import logging
 import ntpath
 import os
 
 from collections import namedtuple
-from shutil import copyfile
-from tempfile import mkstemp
+from typing import Optional
 
-import unicorn
 import verboselogs
+import zebracorn
 
 from capstone import (
     CS_ARCH_ARM,
@@ -40,19 +38,21 @@ from capstone import (
     CS_MODE_MIPS32,
     Cs,
 )
-from unicorn import UcError
+from zebracorn import UcError
 
 from zelos import util
+from zelos.breakpoints import BreakpointManager, BreakState
 from zelos.config_gen import _generate_without_binary, generate_config
 from zelos.exceptions import UnsupportedBinaryError, ZelosLoadException
+from zelos.feeds import FeedManager
 from zelos.file_system import FileSystem
 from zelos.hooks import ExceptionHooks, HookManager, HookType, InterruptHooks
 from zelos.network import Network
 from zelos.plugin import OSPlugins
 from zelos.processes import Processes
 from zelos.state import State
-from zelos.tracer import Tracer
 from zelos.triggers import Triggers
+from zelos.zml import ZmlParser
 
 
 class Engine:
@@ -69,14 +69,6 @@ class Engine:
         if isinstance(config, str):
             config = generate_config(config)
         self.config = config
-        # OS plugins place OS-specific, system-wide, functionality
-        # in engine.zos
-
-        class ZOS(object):
-            def __init__(self):
-                pass
-
-        self.zos = ZOS()
 
         binary = config.filename
 
@@ -85,8 +77,6 @@ class Engine:
         self.cmdline_args = (
             [] if config.cmdline_args is None else config.cmdline_args
         )
-
-        self.random_file_name = getattr(config, "random_file_name", False)
 
         self.log_level = getattr(logging, config.log.upper(), None)
         if not isinstance(self.log_level, int):
@@ -101,53 +91,50 @@ class Engine:
         # If verbose is true, print lots of info, including every
         # instruction
         self.original_file_name = ""
+        self.target_binary_path = ""
         self.main_module_name = ""
         self.main_module = None
 
         self.date = "2019-02-02"
-        self.traceon = ""
-        self.traceoff = ""
 
-        # Handling of the logging
-        self.verbose = False
-        self.verbosity = 0
-        self.fasttrace_on = False
         self.timer = util.Timer()
 
+        self.zml_parser = ZmlParser(self.api)
         self.hook_manager = HookManager(self, self.api)
+        self.feeds = FeedManager(
+            self.config, self.zml_parser, self.hook_manager
+        )
+        self.breakpoints = BreakpointManager(self.hook_manager)
         self.interrupt_handler = InterruptHooks(self.hook_manager, self)
         self.exception_handler = ExceptionHooks(self)
+        self.files = FileSystem(self, self.hook_manager, config.sandbox)
         self.processes = Processes(
             self.hook_manager,
             self.interrupt_handler,
+            self.files,
             self.original_binary,
             self.STACK_SIZE,
             disableNX=self.config.disableNX,
         )
 
-        self.files = FileSystem(self, self.processes, self.hook_manager)
-
         self.os_plugins = OSPlugins(self)
 
         if binary is not None and binary != "":
             self.load_executable(binary, entrypoint_override=config.startat)
+            self.hook_manager.on_entrypoint(self.hook_manager.setup_func_hooks)
         else:
             self._initialize_zelos()  # For testing purposes.
+            # If no binary is passed, default to UNIX-style paths.
+            self.files.setup("/")
 
         head, tail = ntpath.split(config.filename)
         original_filename = tail or ntpath.basename(head)
         self.original_file_name = original_filename
         self.date = config.date
 
-        if config.fasttrace > 0:
-            self.fasttrace_on = True
         if config.dns > 0:
             self.flags_dns = True
 
-        self.set_trace_on(config.traceon)
-        self.traceoff = config.traceoff
-        if config.tracethread != "":
-            self.trace.threads_to_print.add(config.tracethread)
         if config.writetrace != "":
             target_addr = int(config.writetrace, 16)
             self.set_writetrace(target_addr)
@@ -156,22 +143,16 @@ class Engine:
         for m in config.mount:
             try:
                 arch, dest, src = m.split(",")
-                # TODO: Use arch, dest to determine where to mount
-                # For now, always mounts src at default location
+                # TODO: Use arch to determine when to mount
                 if os.path.isdir(src):
-                    self.files.mount_folder(src)
+                    self.files.mount_folder(src, emulated_path=dest)
                 else:
-                    self.files.add_file(src)
+                    self.files.add_file(src, emulated_path=dest)
             except ValueError:
                 self.logger.error(
                     f"Incorrectly formatted input to '--mount': {m}"
                 )
                 continue
-        if config.strace is not None:
-            self.zos.syscall_manager.set_strace_file(config.strace)
-
-        self.verbosity = config.verbosity
-        self.set_verbose(config.verbosity > 0)
 
     def __del__(self):
         try:
@@ -223,12 +204,6 @@ class Engine:
             )
         except ModuleNotFoundError:
             self.logger.setLevel(log_level)
-
-    def log_api(self, args, isNative=False):
-        self.trace.api(args, isNative)
-
-    def log_api_dbg(self, args):
-        self.trace.api_dbg(args)
 
     def hexdump(self, address: int, size: int) -> None:
         import hexdump
@@ -302,27 +277,8 @@ class Engine:
             HookType.MEMORY.WRITE, hook, name="write_trace"
         )
 
-    def _first_parse(self, module_path, random_file_name=False):
+    def _first_parse(self, module_path):
         """ Function to parse an executable """
-
-        if random_file_name:
-            self.original_file_name = module_path
-            original_file_name = module_path
-            # To ensure we don't get any issues with the size of the
-            # file name, we copy the file and rename it 'target'
-            fd, temp_path = mkstemp(dir=".", suffix=".xex")
-            os.close(fd)
-            temp_filename = os.path.basename(temp_path)
-            copyfile(module_path, temp_filename)
-            module_path = temp_filename
-            self.hook_manager.register_close_hook(
-                functools.partial(os.remove, temp_filename)
-            )
-            self.logger.debug(
-                f"Setting random file name for "
-                f"{original_file_name} : {module_path}"
-            )
-
         self.logger.verbose("Parse Main Module")
 
         with open(module_path, "rb") as f:
@@ -351,12 +307,12 @@ class Engine:
         emulation
         """
 
+        self.target_binary_path = module_path
+
         original_file_name = os.path.basename(module_path)
         self.original_file_name = original_file_name
 
-        file = self._first_parse(
-            module_path, random_file_name=self.random_file_name
-        )
+        file = self._first_parse(module_path)
 
         module_path = file.Filepath
         self.main_module = file
@@ -371,12 +327,11 @@ class Engine:
 
         # We need to create this file in the file system, so that other
         # files can access it.
-        self.files.create_file(self.files.zelos_file_prefix + module_path)
-
-        # If you remove one of the hooks on _hook_code, be careful that
-        # you don't break the ability to stop a running emulation
-        if self.verbose:
-            self.set_hook_granularity(HookType.EXEC.INST)
+        self.files.create_file(
+            self.files.emulated_path_module.join(
+                self.files.zelos_file_prefix, module_path
+            )
+        )
 
     def _initialize_zelos(self, binary=None):
         self.state = State(self, binary, self.date)
@@ -405,10 +360,6 @@ class Engine:
             f"Initialized {arch} {self.state.bits} emulator/disassembler"
         )
 
-        self.last_instruction = None
-        self.last_instruction_size = None
-        self.should_print_last_instruction = True
-
         self.triggers = Triggers(self)
         self.processes.set_architecture(self.state)
 
@@ -421,7 +372,7 @@ class Engine:
         p.virtual_filename = self.config.virtual_filename
         p.virtual_path = self.config.virtual_path
 
-        if hasattr(unicorn.unicorn, "WITH_ZEROPOINT_PATCH"):
+        if hasattr(zebracorn.unicorn, "WITH_ZEROPOINT_PATCH"):
 
             def process_switch_wrapper(*args, **kwargs):
                 # Block count interrupt. Fires every 2^N blocks executed
@@ -443,7 +394,6 @@ class Engine:
                 )
             else:
                 self.files.add_file(self.config.filename)
-        self.trace = Tracer(self.helpers, self, self.cs, self.modules)
 
         # TODO: SharedSection needs to be removed
         self.processes.handles.new("section", "\\Windows\\SharedSection")
@@ -474,11 +424,40 @@ class Engine:
 
     def step(self, count: int = 1) -> None:
         """ Steps one assembly level instruction """
-        self.start(count=count, swap_threads=False)
-        if self.last_instruction is not None:
-            self.trace.bb(self.last_instruction, self.last_instruction_size)
-        else:
-            self.trace.bb()
+        # You might be tempted to use zebracorn's "count" argument to
+        # step. However, printing instruction comments relies on an
+        # ad-hoc "post instruction" method.
+        #
+        # Using zebracorn's emu_start count argument
+        #   run INST hook
+        #   run instruction
+        #   zebracorn stops
+        #
+        # Current method:
+        #   run INST hook (don't print)
+        #   run instruction
+        #   run INST hook (do print) then stop before next instruction
+        #   zebracorn stops
+        #
+        # Of course, we can simplify when we get a post instruction
+        # hook working properly.
+
+        inst_count = 0
+
+        def step_n(zelos, addr, size):
+            nonlocal inst_count
+            inst_count += 1
+            if inst_count > count:
+                self.scheduler.stop("step")
+
+        def quit_step_n():
+            nonlocal inst_count
+            return inst_count > count
+
+        self.hook_manager.register_exec_hook(
+            HookType.EXEC.INST, step_n, end_condition=quit_step_n
+        )
+        return self.start(swap_threads=False)
 
     def step_over(self, count: int = 1) -> None:
         """
@@ -502,7 +481,7 @@ class Engine:
             self.step()
         return True
 
-    def start(self, count=0, timeout=0, swap_threads=True) -> None:
+    def start(self, timeout=0, swap_threads=True) -> Optional[BreakState]:
         """
         Starts execution of the program at the given offset or entry
         point.
@@ -522,7 +501,7 @@ class Engine:
             self.processes.logger.info(
                 "No more processes or threads to execute."
             )
-            return
+            return None
 
         self.ehCount = 0
 
@@ -531,8 +510,10 @@ class Engine:
             if self.current_thread is None:
                 self.processes.swap_with_next_thread()
 
-            self.last_instruction = self.emu.getIP()
-            self.last_instruction_size = 1
+            self.plugins.trace.should_print_last_instruction = False
+            self.plugins.trace.last_instruction = self.emu.getIP()
+            self.plugins.trace.last_instruction_size = 1
+
             try:
                 if self.processes.num_active_processes() == 0:
                     self.processes.logger.info(
@@ -540,7 +521,7 @@ class Engine:
                     )
                 else:
                     # Execute until emulator exception
-                    self._run(self.current_process, count)
+                    self._run(self.current_process)
             except UcError as e:
                 # TODO: This is a special case for forcing a stop.
                 # Sometimes setting a stop reason doesn't stop
@@ -562,20 +543,26 @@ class Engine:
                     break
                 self.processes.swap_with_next_thread()
 
-        return
+        return self.kernel.generate_break_state()
 
-    def _run(self, p, count):
+    def _run(self, p):
         t = p.current_thread
         assert (
             t is not None
         ), "Current thread is None. Something has gone horribly wrong."
 
-        t.emu.is_running = True
+        self.breakpoints._disable_breakpoints_on_start(t.getIP())
+        if t.emu.is_running:
+            self.logger.critical(
+                "Trying to run zebracorn while zebracorn is already running. "
+                "You are entering untested waters"
+            )
+
         try:
-            t.emu.emu_start(t.getIP(), 0, count=count)
+            t.emu.emu_start(t.getIP(), 0)
         finally:
             stop_addr = p.threads.scheduler._pop_stop_addr(t.id)
-            t.emu.is_running = False
+            self.hook_manager._clear_deleted_hooks()
 
         # Only set the stop addr if you stopped benignly
         if stop_addr is not None:
@@ -583,7 +570,7 @@ class Engine:
 
     def _should_continue(self):
         """
-        Takes the reasons for ending unicorn execution, and decides
+        Takes the reasons for ending zebracorn execution, and decides
         whether to continue or end execution
         """
 
@@ -620,109 +607,9 @@ class Engine:
                 % (address, service)
             )
 
-    def set_trace_on(self, val):
-        try:
-            i = int(val, 0)
-
-            def f(zelos, address, size):
-                self.verbosity = 2  # Allow logging inside modules
-                self.set_verbose(True)
-
-            self.hook_manager.register_exec_hook(
-                HookType.EXEC.INST, f, name="traceon", ip_low=i, ip_high=i
-            )
-        except ValueError:
-            pass
-        self.traceon = val
-
     def _check_timeout(self):
         if self.timer.is_timed_out():
             self.scheduler.stop("timeout")
-
-    # Hook invoked for each instruction or block.
-    def _hook_code(self, zelos, address, size):
-        try:
-            self._hook_code_impl(zelos, address, size)
-            self._check_timeout()
-        except Exception:
-            if self.current_thread is not None:
-                self.current_process.threads.kill_thread(
-                    self.current_thread.id
-                )
-            self.logger.exception("Stopping execution due to exception")
-
-    def _hook_code_impl(self, zelos, address, size):
-        current_process = self.current_process
-        current_thread = self.current_thread
-        # TCG Dump example usage:
-        # self.emu.get_tcg(0, 0)
-        if current_thread is None:
-            self.emu.emu_stop()
-            return
-
-        # Log the total number of blocks executed per thread. Swap
-        # threads if the specified number of blocks is exceeded and
-        # other threads exist
-        current_thread.total_blocks_executed += 1
-        if (
-            current_thread.total_blocks_executed % 1000 == 0
-            and address not in self.modules.reverse_module_functions
-        ):
-            self.current_process.scheduler.stop_and_exec(
-                "process swap", self.processes.schedule_next
-            )
-            return
-
-        if self.verbose:
-            if self.should_print_last_instruction:  # Print block
-                # Turn on full trace to do trace comparison
-                self.trace.bb(
-                    self.last_instruction,
-                    self.last_instruction_size,
-                    full_trace=False,
-                )
-            self.should_print_last_instruction = True
-            if (
-                self.fasttrace_on
-                and current_process.threads.block_seen_before(address)
-            ):
-                self.should_print_last_instruction = False
-
-        current_process.threads.record_block(address)
-
-        self.last_instruction = address
-        self.last_instruction_size = size
-
-    def set_verbose(self, should_set_verbose: bool) -> None:
-        """
-        Used to set the verbosity level, and change the hooks.
-        This prevents two types of issues:
-
-        1) Running block hooks when printing individual instructions
-               This will cause the annotations that are printed to be
-               the values at the end of the block's execution
-        2) Running instruction hooks when not printing instructions
-               This will slow down the emulation (sometimes
-               considerably)
-        """
-        if self.verbose == should_set_verbose:
-            return
-        self.verbose = should_set_verbose
-
-        if should_set_verbose:
-            self.set_hook_granularity(HookType.EXEC.INST)
-        else:
-            self.set_hook_granularity(HookType.EXEC.BLOCK)
-
-    def set_hook_granularity(self, granularity: HookType.EXEC):
-        try:
-            self.hook_manager.delete_hook(self._code_hook_info)
-        except AttributeError:
-            pass  # first time setting _code_hook_info
-
-        self._code_hook_info = self.hook_manager.register_exec_hook(
-            granularity, self._hook_code, name="code_hook"
-        )
 
     # Estimates the number of function arguments with the assumption
     # that the callee is responsible for cleaning up the stack.

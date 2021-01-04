@@ -16,15 +16,19 @@
 # <http://www.gnu.org/licenses/>.
 # ======================================================================
 
+import logging
+
 from collections import defaultdict
+from os.path import abspath
 from typing import Any, Callable, Optional
 
 from zelos.api.memory_api import MemoryApi
 from zelos.api.regs_api import RegsApi
+from zelos.breakpoints import BreakState
 from zelos.config_gen import generate_config, generate_config_from_cmdline
 from zelos.engine import Engine
 from zelos.hooks import HookInfo, HookType
-from zelos.plugin import Plugins
+from zelos.plugin import ParsedBinary, Plugins
 from zelos.processes import Process
 from zelos.threads import Thread
 
@@ -47,12 +51,12 @@ class Zelos:
             from zelos import Zelos
 
             # initialize zelos with binary name, 2 cmdline args, and
-            # verbosity flag set to 1
+            # turn on the inst feed to print instructions.
             z = Zelos(
                 "binary_to_emulate"
                 "ARG1",
                 "ARG2",
-                verbosity=1,
+                inst=True,
             )
     """
 
@@ -71,9 +75,14 @@ class Zelos:
         # If you need to access data that is not exposed through the api
         # yet, access the internal_engine representation at your own
         # risk.
-        Engine(config=config, api=self)
+        e = Engine(config=config, api=self)
         self.plugins = Plugins(self, ["plugins"])
+        self.plugins.initialize()
+        self.internal_engine = e  # Used to inform what type this is.
         self.internal_engine.plugins = self.plugins
+
+        # After setup allow MEMORY.INTERNAL_* hooks to run.
+        e.hook_manager._enable_internal_memory_hooks()
 
     # **** Memory API ****
     @property
@@ -90,6 +99,14 @@ class Zelos:
         Returns the :py:class:`~zelos.api.regs_api.RegsApi` object.
         """
         return self._regs
+
+    @property
+    def logger(self):
+        """
+        Returns a logger that will behave in accordance to the --log
+        config/cmdline option.
+        """
+        return logging.getLogger(__name__)
 
     # **** Begin Hook API ****
     def hook_memory(
@@ -184,10 +201,10 @@ class Zelos:
                 specified event occurs. The function should accept the
                 following inputs: (zelos, address, size).
                 The return value of "callback" is ignored.
-            mem_low: If specified, only executes callback if the
+            ip_low: If specified, only executes callback if the
                 event occurs at an address greater than or equal to
                 this.
-            mem_high: If specified, only executes callback if the
+            ip_high: If specified, only executes callback if the
                 event occurs at an address less than or equal to this.
             name: An identifier for this hook. Used for debugging.
             end_condition: If specified, executes after the callback. If
@@ -220,14 +237,14 @@ class Zelos:
             end_condition=end_condition,
         )
 
-    def hook_close(self, closure: Callable[[], Any]) -> HookInfo:
+    def hook_close(self, callback: Callable[[], Any]) -> HookInfo:
         """
-        Registers a closure that is called when
+        Registers a callback that is called when
         :py:meth:`zelos.Engine.close()` is called.
 
         Args:
-            closure: Called when zelos is closed. Does not take any
-                arguments. The return value of `closure` is ignored
+            callback: Called when zelos is closed. Does not take any
+                arguments. The return value of `callback` is ignored
 
         Example:
             .. code-block:: python
@@ -246,16 +263,17 @@ class Zelos:
                 # Hooks are run at this point
                 z.close()
         """
-        return self.internal_engine.hook_manager.register_close_hook(closure)
+        return self.internal_engine.hook_manager.register_close_hook(callback)
 
     def hook_syscalls(
         self,
         syscall_hook_type: HookType.SYSCALL,
         callback: Callable[["Zelos", str, "Args", int], Any],
         name: str = None,
+        syscall_name: str = None,
     ) -> HookInfo:
         """
-        Registers a closure that is called when a syscall is invoked.
+        Registers a callback that is called when a syscall is invoked.
 
         Args:
             syscall_hook_type: Decides when the hook should be triggered
@@ -266,6 +284,8 @@ class Zelos:
                 following inputs:
                 (zelos, syscall_name, args, return_value)
                 The return value of "callback" is ignored.
+            syscall_name: Restricts calls of the hook to syscalls that
+                match the given name.
             name: An identifier for this hook. Used for debugging.
 
         Example:
@@ -286,7 +306,24 @@ class Zelos:
 
         """
         return self.internal_engine.hook_manager.register_syscall_hook(
-            syscall_hook_type, callback, name
+            syscall_hook_type, callback, name=name, syscall_name=syscall_name
+        )
+
+    def hook_zml(
+        self, zml_string: str, callback: Callable[[], Any]
+    ) -> HookInfo:
+        """
+        Register a callback that triggers when a given ZML string is
+        satisfied. For more information on ZML, view
+        :py:class:`zelos.zml.ZmlParser`.
+
+        Args:
+            zml_string: Specifies condition to call callback.
+            callback: The code that should be executed when the specified
+                event occurs.
+        """
+        return self.internal_engine.hook_manager.register_zml_hook(
+            zml_string, callback
         )
 
     def delete_hook(self, hook_info: HookInfo) -> None:
@@ -294,7 +331,7 @@ class Zelos:
 
     # **** Begin Debugging API ****
 
-    def start(self, timeout: float = 0) -> None:
+    def start(self, timeout: float = 0) -> Optional[BreakState]:
         """
         Begin emulation. When called for the first time, begins
         execution at the binary entry point. If the emulation is
@@ -315,7 +352,7 @@ class Zelos:
                 z.start()
 
         """
-        self.internal_engine.start(timeout=timeout)
+        return self.internal_engine.start(timeout=timeout)
 
     def step(self, count=1) -> None:
         """
@@ -325,7 +362,18 @@ class Zelos:
             count: Maximum number of instructions to execute before
                 stopping
         """
-        self.internal_engine.step(count=count)
+        return self.internal_engine.step(count=count)
+
+    def next(self, count=1) -> None:
+        """
+        Begin emulation, executing `count` instructions not including
+        instructions inside function calls.
+
+        Args:
+            count: Maximum number of instructions to execute before
+                stopping.
+        """
+        return self.internal_engine.step_over(count=count)
 
     def stop(self, reason: str = "plugin"):
         """
@@ -392,22 +440,9 @@ class Zelos:
                 z.start()
 
         """
-
-        def hook(zelos, access, size):
-            zelos.stop("breakpoint")
-
-        hook_info = self.internal_engine.hook_manager.register_exec_hook(
-            HookType.EXEC.INST,
-            hook,
-            ip_low=address,
-            ip_high=address,
-            name=f"breakpoint_{address:x}",
-            end_condition=lambda: temporary,
+        self.internal_engine.breakpoints.set_breakpoint(
+            address, temporary=temporary
         )
-
-        self._breakpoints[address] = hook_info
-
-        return True
 
     def remove_breakpoint(self, address: int):
         """
@@ -430,8 +465,7 @@ class Zelos:
                 z.start()
 
         """
-        hook_info = self._breakpoints[address]
-        self.internal_engine.hook_manager.delete_hook(hook_info)
+        self.internal_engine.breakpoints.remove_breakpoint(address)
 
     def set_syscall_breakpoint(self, syscall_name: str):
         """
@@ -452,7 +486,7 @@ class Zelos:
                 z.start()
 
         """
-        self.internal_engine.zos.syscall_manager.set_breakpoint(syscall_name)
+        self.internal_engine.kernel.set_breakpoint(syscall_name)
 
     def remove_syscall_breakpoint(self, syscall_name: str):
         """
@@ -475,9 +509,7 @@ class Zelos:
                 z.start()
 
         """
-        self.internal_engine.zos.syscall_manager.remove_breakpoint(
-            syscall_name
-        )
+        self.internal_engine.kernel.remove_breakpoint(syscall_name)
 
     def set_watchpoint(
         self, address: int, read: bool, write: bool, temporary: bool = False
@@ -622,6 +654,58 @@ class Zelos:
 
         """
         return self.internal_engine.current_process.current_thread
+
+    @property
+    def main_binary(self) -> Optional[ParsedBinary]:
+        """
+        Returns the parsed main binary, if it exists, otherwise returns
+        None.
+        Note that the "main" binary denotes the binary that is loaded by
+        Zelos during emulation, not necessarily the binary that
+        is specified as input (the "target" binary). When the specified
+        input binary ("target") is statically linked, it is also the
+        "main" binary. However, when the specified input binary
+        ("target") is dynamically linked, the "main" binary instead
+        refers to the dynamic linker/loader.
+
+        :type: :py:class:`zelos.plugin.ParsedBinary`
+
+        """
+        return self.internal_engine.main_module
+
+    @property
+    def main_binary_path(self) -> Optional[str]:
+        """
+        Returns the absolute path to the main binary, if it exists, otherwise
+        returns None.
+        Note that the "main" binary denotes the binary that is loaded by
+        Zelos during emulation, not necessarily the binary that
+        is specified as input (the "target" binary). When the specified
+        input binary ("target") is statically linked, it is also the "main"
+        binary. However, when the specified input binary ("target") is
+        dynamically linked, the "main" binary instead refers to the dynamic
+        linker/loader.
+
+        :type: str
+
+        """
+        if self.internal_engine.main_module_name:
+            return abspath(self.internal_engine.main_module_name)
+        return None
+
+    @property
+    def target_binary_path(self) -> Optional[str]:
+        """
+        Returns the absolute path to the target binary, if it exists,
+        otherwise returns None. Note that the "target" binary denotes
+        the binary specified as input to Zelos.
+
+        :type: str
+
+        """
+        if self.internal_engine.target_binary_path:
+            return abspath(self.internal_engine.target_binary_path)
+        return None
 
 
 class ZelosCmdline(Zelos):

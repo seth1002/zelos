@@ -16,8 +16,9 @@
 # ======================================================================
 
 from .arg_base import ArgFactory
+from .kernel_base import IKernel
 from .loader_base import Loader
-from .parser_base import Parser, Section
+from .parser_base import ParsedBinary, Section
 from .plugin import (
     CommandLineOption,
     IPlugin,
@@ -27,7 +28,6 @@ from .plugin import (
     PluginCommands,
     Plugins,
 )
-from .syscall_manager_base import SyscallManager
 
 
 __all__ = [
@@ -38,9 +38,9 @@ __all__ = [
     "OSPlugins",
     "ISubcommand",
     "PluginCommands",
-    "SyscallManager",
+    "IKernel",
     "Loader",
-    "Parser",
+    "ParsedBinary",
     "Section",
     "ArgFactory",
 ]

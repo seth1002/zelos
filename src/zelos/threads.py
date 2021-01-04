@@ -20,11 +20,12 @@ from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, List, Optional
 
-from unicorn import UC_PROT_READ, UC_PROT_WRITE
+from zebracorn import UC_PROT_READ, UC_PROT_WRITE
 
 import zelos.util as util
 
 from zelos.exceptions import ZelosException
+from zelos.hooks import HookType
 from zelos.scheduler import Scheduler
 from zelos.util import struct
 
@@ -226,9 +227,11 @@ class Thread(object):
         return self.threads.emu.unpack(x, bytes, little_endian, signed)
 
     def __str__(self):
-        return f"{self.name} (0x{self.id:x}), PRI: {self.priority}, "
-        f"parent: {self.parent}, IP: 0x{self.getIP():x}, "
-        f"blocks_exec'd: 0x{self.total_blocks_executed:x}, {self.state}"
+        return (
+            f"{self.name} (0x{self.id:x}), PRI: {self.priority}, "
+            f"parent: {self.parent}, IP: 0x{self.getIP():x}, "
+            f"blocks_exec'd: 0x{self.total_blocks_executed:x}, {self.state}"
+        )
 
     def __lt__(self, other):  # Python 3
         return other.priority < self.priority  # Sorts high to low
@@ -273,7 +276,7 @@ class Thread(object):
             elif address == sp:
                 prefix = " sp --> "
             try:
-                val = self.emu.mem_read(address, ptr_size)
+                val = self.memory.read(address, ptr_size)
                 val = struct.unpack("<L", val)[0]
                 stack_str = prefix + "0x{0:08x}: {1:08x}".format(address, val)
             except Exception:
@@ -298,7 +301,7 @@ class Threads:
     This class should be manipulated through the process layer.
     """
 
-    def __init__(self, emu, memory, stack_size):
+    def __init__(self, emu, memory, stack_size, hook_manager):
         self.stack_min = 0x00000000
         self.stack_max = 0xC0000000  # MAX MIPS 32-bit handles w/ qemu
 
@@ -306,6 +309,7 @@ class Threads:
         self.scheduler = Scheduler(self, emu)
         self.memory = memory
         self.stack_size = stack_size
+        self._hook_manager = hook_manager
         self.logger = logging.getLogger(__name__)
         self._reset()
 
@@ -405,12 +409,12 @@ class Threads:
         current_thread_tid = None
         if self.current_thread is not None:
             current_thread_tid = self.current_thread.id
-            self.swap_with_thread(tid=t.id)
+            self._swap_thread(t.id)
 
         ret_val = closure()
 
         if current_thread_tid is not None:
-            self.swap_with_thread(tid=current_thread_tid)
+            self._swap_thread(current_thread_tid)
         return ret_val
 
     # TODO(V): Remove this function, put in timeleap
@@ -712,14 +716,33 @@ class Threads:
 
         self._swap(t)
 
+    def _swap_thread(self, tid=None) -> None:
+        """
+        Internal function that swaps the current thread with the thread
+        of the specified tid or the next available thread, without invoking
+        thread swap hooks. This function is intended to be used by functions
+        that need to temporarily swap threads internally.
+        """
+        if tid is None:
+            self._check_paused_threads()
+            t = self._next()
+        else:
+            t = self.get_thread(tid)
+        if self.current_thread is not None:
+            self.current_thread.save_context()
+        self._load(t)
+
     def _swap(self, thread):
         """
         Swaps the currently executing thread with the specified thread
         in the emulator
         """
-        if self.current_thread is not None:
-            self.current_thread.save_context()
+        old_thread = self.current_thread
+        if old_thread is not None:
+            old_thread.save_context()
         self._load(thread)
+        for hook in self._hook_manager._get_hooks(HookType.THREAD.SWAP):
+            hook(old_thread)
 
     def _load(self, thread):
         """ Loads the specified thread into the emulator """

@@ -19,10 +19,11 @@
 import unittest
 
 from collections import defaultdict
+from io import StringIO
 from os import path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
-from zelos import HookType, Zelos
+from zelos import HookType, IPlugin, Zelos
 
 
 DATA_DIR = path.join(path.dirname(path.abspath(__file__)), "data")
@@ -72,6 +73,87 @@ class ZelosTest(unittest.TestCase):
 
         self.assertGreater(len(read_addresses), 0)
         self.assertGreater(len(write_addresses), 0)
+
+    def test_zelos_memory_hook(self):
+        recorded_reads = {}
+
+        def zelos_read_hook(z, access, address, size, value):
+            recorded_reads[address] = value
+
+        recorded_writes = {}
+
+        def zelos_write_hook(z, access, address, size, value):
+            recorded_writes[address] = value
+
+        recorded_maps = {}
+
+        def zelos_map_hook(z, access, address, size, value):
+            recorded_maps[address] = size
+
+        class TestPlugin(IPlugin):
+            def __init__(self, z):
+                super().__init__(z)
+                z.hook_memory(
+                    HookType.MEMORY.INTERNAL_MAP,
+                    zelos_map_hook,
+                    name="test_zelos_map",
+                )
+                z.hook_memory(
+                    HookType.MEMORY.INTERNAL_READ,
+                    zelos_read_hook,
+                    name="test_zelos_read",
+                    end_condition=lambda: True,
+                )
+                z.hook_memory(
+                    HookType.MEMORY.INTERNAL_WRITE,
+                    zelos_write_hook,
+                    mem_low=0x08109A00,
+                    mem_high=0x08109B00,
+                    name="test_zelos_write",
+                )
+
+        z = Zelos(path.join(DATA_DIR, "static_elf_helloworld"))
+        self.assertEqual(recorded_reads, {})
+        self.assertEqual(recorded_writes, {})
+
+        z.memory.map(0xC0BAF000, 0x1000)
+        self.assertEqual(recorded_maps, {0xC0BAF000: 0x1000})
+
+        z.memory._memory.map_file(
+            0xD0BAF000, path.join(DATA_DIR, "dynamic_elf_helloworld")
+        )
+        self.assertEqual(
+            recorded_maps, {0xC0BAF000: 0x1000, 0xD0BAF000: 0x2000}
+        )
+
+        z.memory.read(0x08109A7E, 4)
+
+        self.assertEqual(recorded_reads, {0x08109A7E: b"\xc3\x90\x8b\x06"})
+        self.assertEqual(recorded_writes, {})
+
+        z.memory.read(0x08109A7D, 4)
+
+        self.assertEqual(recorded_reads, {0x08109A7E: b"\xc3\x90\x8b\x06"})
+        self.assertEqual(recorded_writes, {})
+
+        z.memory.write(0x08109A00, b"\x00\x01\x02\x03")
+        self.assertEqual(recorded_reads, {0x08109A7E: b"\xc3\x90\x8b\x06"})
+        self.assertEqual(recorded_writes, {0x08109A00: b"\x00\x01\x02\x03"})
+
+        z.memory.write(0x08109B01, b"\x00\x01\x02\x04")
+        self.assertEqual(recorded_reads, {0x08109A7E: b"\xc3\x90\x8b\x06"})
+        self.assertEqual(recorded_writes, {0x08109A00: b"\x00\x01\x02\x03"})
+
+        z.memory.write(0x081099FC, b"\x00\x01\x02\x04")
+        self.assertEqual(recorded_reads, {0x08109A7E: b"\xc3\x90\x8b\x06"})
+        self.assertEqual(recorded_writes, {0x08109A00: b"\x00\x01\x02\x03"})
+
+        z.memory.write(0x081099FD, b"\x00\x01\x02\x04")
+        self.assertEqual(recorded_reads, {0x08109A7E: b"\xc3\x90\x8b\x06"})
+        self.assertEqual(
+            recorded_writes,
+            {0x08109A00: b"\x00\x01\x02\x03", 0x081099FD: b"\x00\x01\x02\x04"},
+        )
 
     def test_unmapped_memory_hook(self):
         z = Zelos(path.join(DATA_DIR, "static_elf_helloworld"))
@@ -147,6 +229,15 @@ class ZelosTest(unittest.TestCase):
 
         z.hook_syscalls(HookType.SYSCALL.AFTER, syscall_hook)
 
+        specific_syscall_cnt = defaultdict(int)
+
+        def specific_syscall_hook(zelos, syscall_name, args, return_value):
+            specific_syscall_cnt[syscall_name] += 1
+
+        z.hook_syscalls(
+            HookType.SYSCALL.AFTER, specific_syscall_hook, syscall_name="brk"
+        )
+
         z.start()
 
         self.assertEqual(syscall_cnt["write"], 1)
@@ -158,13 +249,32 @@ class ZelosTest(unittest.TestCase):
         self.assertEqual(syscall_cnt["fstat64"], 1)
         self.assertEqual(syscall_cnt["exit_group"], 1)
 
+        self.assertEqual(specific_syscall_cnt["write"], 0)
+        self.assertEqual(specific_syscall_cnt["brk"], 4)
+
     def test_step(self):
         z = Zelos(path.join(DATA_DIR, "static_elf_helloworld"))
-        addr = 0x0816348F
+        addr = 0x080EC3F0  # Call, should step into it
         z.plugins.runner.run_to_addr(addr)
         self.assertEqual(z.thread.getIP(), addr)
         z.step()
-        self.assertEqual(z.thread.getIP(), 0x08163492)
+        self.assertEqual(
+            z.thread.getIP(),
+            0x08048DBD,
+            f"{z.thread.getIP():x} vs. {0x08048DBD:x}",
+        )
+
+    def test_next(self):
+        z = Zelos(path.join(DATA_DIR, "static_elf_helloworld"))
+        addr = 0x080EC3F0  # Call, should step over it.
+        z.plugins.runner.run_to_addr(addr)
+        self.assertEqual(z.thread.getIP(), addr)
+        z.next()
+        self.assertEqual(
+            z.thread.getIP(),
+            0x080EC3F5,
+            f"{z.thread.getIP():x} vs. {0x080EC3F5:x}",
+        )
 
     def test_stop(self):
         z = Zelos(path.join(DATA_DIR, "static_elf_helloworld"))
@@ -197,18 +307,32 @@ class ZelosTest(unittest.TestCase):
 
     def test_breakpoint(self):
         z = Zelos(path.join(DATA_DIR, "static_elf_helloworld"))
-        addr = 0x0816348F
+        addr = 0x8048B72
         z.set_breakpoint(addr)
         z.start()
 
         tm = z.internal_engine.thread_manager
         self.assertEqual(tm.num_active_threads(), 1)
-        self.assertEqual(z.regs.getIP(), addr)
+        self.assertEqual(
+            z.regs.getIP(), addr, f"{z.regs.getIP():x} vs. {addr:x}"
+        )
 
+        z.step()
+        self.assertEqual(
+            z.regs.getIP(), 0x8048B73, f"{z.regs.getIP():x} vs. {0x8048b73:x}"
+        )
+
+    def test_remove_breakpoint(self):
+        z = Zelos(path.join(DATA_DIR, "static_elf_helloworld"))
+        addr = 0x8048B72
+        z.set_breakpoint(addr)
         z.remove_breakpoint(addr)
+        z.set_breakpoint(0x8048B73)
         z.start()
 
-        self.assertEqual(1, len(tm.completed_threads))
+        self.assertEqual(
+            z.regs.getIP(), 0x8048B73, f"{z.regs.getIP():x} vs. {0x8048b73:x}"
+        )
 
     def test_syscall_breakpoint(self):
         z = Zelos(path.join(DATA_DIR, "static_elf_helloworld"))
@@ -217,7 +341,7 @@ class ZelosTest(unittest.TestCase):
 
         z.start()
 
-        brk = 0x0815B575
+        brk = 0x0815B577
 
         self.assertEqual(z.thread.getIP(), brk)
 
@@ -247,15 +371,66 @@ class ZelosTest(unittest.TestCase):
         )
 
     def test_date(self):
-        z = Zelos(None)
-        d = z.date
+        z = Zelos(path.join(DATA_DIR, "date"))
 
-        self.assertEqual(d, "2019-02-02")
+        self.assertEqual(z.date, "2019-02-02")
 
         z.date = "2019-03-03"
-        d = z.date
+        self.assertEqual(z.date, "2019-03-03")
 
-        self.assertEqual(d, "2019-03-03")
+        with patch("sys.stdout", new=StringIO()) as stdout:
+            z.start()
+            self.assertIn("Sun Mar  3", stdout.getvalue())
+            self.assertIn("UTC 2019", stdout.getvalue())
+
+    def test_memory_search(self):
+        z = Zelos(None)
+        z.memory.map(0x1000, 0x1000)
+        z.memory.write(0x1000, b"\x00\x01\x02\x03\x00\x01\x02\x00\x01\x01\x01")
+        self.assertEqual(
+            [0x1000, 0x1004, 0x1007], z.memory.search(b"\x00\x01")
+        )
+        self.assertEqual([0x1008], z.memory.search(b"\x01\x01"))
+
+    def test_get_region(self):
+        z = Zelos(None)
+        self.assertEqual(len(z.memory.get_regions()), 2)
+        z.memory.map(0x1000, 0x1000)
+        reg = z.memory.get_region(0x1000)
+        self.assertIsNotNone(reg)
+        self.assertEqual(len(z.memory.get_regions()), 3)
+        z.memory.map(0x2000, 0x1000)
+        reg = z.memory.get_region(0x2000)
+        self.assertIsNotNone(reg)
+        self.assertEqual(len(z.memory.get_regions()), 4)
+
+    def test_binary_paths(self):
+        z = Zelos(None)
+        self.assertIsNone(z.main_binary)
+        self.assertIsNone(z.main_binary_path)
+
+        z = Zelos(path.join(DATA_DIR, "static_elf_helloworld"))
+        self.assertIsNotNone(z.main_binary)
+        self.assertEqual(
+            path.basename(z.main_binary_path), "static_elf_helloworld"
+        )
+        self.assertEqual(
+            path.basename(z.target_binary_path), "static_elf_helloworld"
+        )
+
+        z = Zelos(path.join(DATA_DIR, "dynamic_elf_helloworld"))
+        self.assertIsNotNone(z.main_binary)
+        self.assertNotEqual(
+            path.basename(z.main_binary_path), "dynamic_elf_helloworld"
+        )
+        self.assertEqual(
+            path.basename(z.target_binary_path), "dynamic_elf_helloworld"
+        )
+
+    def test_memory_api_pack(self):
+        z = Zelos(None)
+        self.assertEqual(123, z.memory.unpack(z.memory.pack(123)))
+        self.assertEqual(-1, z.memory.unpack(z.memory.pack(-1), signed=True))
 
 
 def main():

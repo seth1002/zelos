@@ -16,7 +16,7 @@
 # ======================================================================
 from collections import defaultdict
 
-from zelos import CommandLineOption, HookType, IPlugin
+from zelos import CommandLineOption, HookType, IPlugin, Zelos
 
 
 CommandLineOption(
@@ -41,54 +41,84 @@ CommandLineOption(
     help="Swap threads after every SYSCALL_THREAD_SWAP syscalls are executed",
 )
 
+CommandLineOption(
+    "rep_syscall_print_limit",
+    type=int,
+    default=50,
+    help=(
+        "After repeating this number of times, syscall printing is "
+        "temporarily disabled."
+    ),
+)
+
 
 class SyscallLimiter(IPlugin):
     """ Limit execution by the number of syscalls overall or by thread. """
 
     def __init__(self, z):
         super().__init__(z)
+        self.syscall_limit = z.config.syscall_limit
+        self.syscall_thread_limit = z.config.syscall_thread_limit
+        self.syscall_thread_swap = z.config.syscall_thread_swap
+        self.rep_syscall_print_limit = z.config.rep_syscall_print_limit
         if (
-            z.config.syscall_limit > 0
-            or z.config.syscall_thread_limit > 0
-            or z.config.syscall_thread_swap > 0
+            self.syscall_limit > 0
+            or self.syscall_thread_limit > 0
+            or self.syscall_thread_swap > 0
+            or self.rep_syscall_print_limit > 0
         ):
             self.zelos.hook_syscalls(
                 HookType.SYSCALL.AFTER, self._syscall_callback
             )
         self.syscall_cnt = 0
         self.syscall_thread_cnt = defaultdict(int)
+        # Used for detecting repetition in syscalls.
+        self._last_syscall = None
+        self._last_syscall_count = 0
 
-    def _syscall_callback(self, zelos, sysname, args, retval):
-        if zelos.thread is None:
-            return
-
-        thread_name = zelos.thread.name
-
+    def _syscall_callback(self, zelos: Zelos, sysname: str, args, retval: int):
         self.syscall_cnt += 1
-        self.syscall_thread_cnt[thread_name] += 1
 
         # End execution if syscall limit reached
-        if (
-            zelos.config.syscall_limit > 0
-            and self.syscall_cnt >= zelos.config.syscall_limit
-        ):
+        if self.syscall_limit > 0 and self.syscall_cnt >= self.syscall_limit:
             zelos.stop("syscall limit")
             return
 
         # End thread if syscall thread limit reached
-        if (
-            zelos.config.syscall_thread_limit != 0
-            and self.syscall_thread_cnt[thread_name]
-            % zelos.config.syscall_thread_limit
-            == 0
-        ):
-            zelos.end_thread()
-            return
+        if self.syscall_thread_limit != 0 and zelos.thread is not None:
+            thread_name = zelos.thread.name
+            self.syscall_thread_cnt[thread_name] += 1
+            if (
+                self.syscall_thread_cnt[thread_name]
+                % self.syscall_thread_limit
+                == 0
+            ):
+                zelos.end_thread()
+                return
 
         # Swap threads if syscall thread swap limit reached
         if (
-            zelos.config.syscall_thread_swap > 0
-            and self.syscall_cnt % zelos.config.syscall_thread_swap == 0
+            self.syscall_thread_swap > 0
+            and self.syscall_cnt % self.syscall_thread_swap == 0
         ):
             zelos.swap_thread("syscall limit thread swap")
-        return
+
+        # Disable syscall printing if lots of repetitions occur
+        if self.rep_syscall_print_limit > 0:
+            rep_print_limit = self.rep_syscall_print_limit
+            kernel = zelos.internal_engine.kernel
+            if sysname == self._last_syscall:
+                self._last_syscall_count += 1
+            else:
+                self._last_syscall = sysname
+                if not kernel.should_print_syscalls:
+                    self.logger.info(f"Syscall printing reenabled")
+                    kernel.should_print_syscalls = True
+                self._last_syscall_count = 1
+
+            if self._last_syscall_count == rep_print_limit:
+                self.logger.info(
+                    f"Syscall {self._last_syscall} called "
+                    f"{rep_print_limit} times. No longer printing syscalls"
+                )
+                kernel.should_print_syscalls = False

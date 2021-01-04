@@ -17,8 +17,9 @@
 
 import ctypes
 
-from typing import Optional
+from typing import List, Optional
 
+from zelos.emulator.base import MemoryRegion
 from zelos.enums import ProtType
 
 
@@ -44,7 +45,7 @@ class MemoryApi:
         """
         return self._memory.read(addr, size)
 
-    def write(self, addr: int, data: bytearray) -> None:
+    def write(self, addr: int, data: bytearray) -> int:
         """
         Writes specified bytes to memory. Requires that the specified
         address is mapped.
@@ -71,7 +72,7 @@ class MemoryApi:
                 false.
 
         Returns:
-            Integer represntation of bytes read.
+            Integer representation of bytes read.
         """
         return self._memory.read_int(addr, size, signed)
 
@@ -122,7 +123,7 @@ class MemoryApi:
         Returns:
             String read from memory.
         """
-        return self._memory.write_wstring(addr, size)
+        return self._memory.read_wstring(addr, size)
 
     def read_punicode_string(self, addr: int) -> str:
         """
@@ -256,7 +257,6 @@ class MemoryApi:
         kind: str = "",
         module_name: str = "",
         prot: int = ProtType.RWX,
-        ptr: Optional[ctypes.POINTER] = None,
         reserve: bool = False,
     ) -> None:
         """
@@ -274,14 +274,37 @@ class MemoryApi:
                 this region.
             prot: An integer representing the RWX protection to be set
                 on the mapped region.
-            ptr: If specified, creates a memory map from the pointer.
             reserve: Reserves memory to prepare for mapping. An option
                 used in Windows.
 
         """
         return self._memory.map(
-            address, size, name, kind, module_name, prot, ptr, reserve
+            address, size, name, kind, module_name, prot, reserve
         )
+
+    def get_region(self, address: int) -> Optional[MemoryRegion]:
+        """
+        Returns the memory region that the specified address is mapped in,
+        if one exists, otherwise returns None.
+
+        Args:
+            address: Address used to specify a region of memory.
+
+        Returns:
+            A :py:class:`zelos.emulator.base.MemoryRegion` containing the
+            specified address, or None if the address is not mapped in any
+            region.
+        """
+        return self._memory.get_region(address)
+
+    def get_regions(self) -> List[MemoryRegion]:
+        """
+        Returns a list of all mapped memory regions.
+
+        Returns:
+            A list of :py:class:`zelos.emulator.base.MemoryRegion` objects.
+        """
+        return self._memory.get_regions()
 
     def read_ptr(self, addr: int) -> int:
         """
@@ -304,10 +327,10 @@ class MemoryApi:
         signed: bool = False,
     ) -> bytes:
         """
-        Unpacks an integer from a byte format. Defaults to the
+        Packs an integer into bytes. Defaults to the
         current architecture bytes and endianness.
         """
-        return self._memory.pack(
+        return self._memory.emu.pack(
             x, bytes=bytes, little_endian=little_endian, signed=signed
         )
 
@@ -322,7 +345,7 @@ class MemoryApi:
         Unpacks an integer from a byte format. Defaults to the
         current architecture bytes and endianness.
         """
-        return self._memory.unpack(
+        return self._memory.emu.unpack(
             x, bytes=bytes, little_endian=little_endian, signed=signed
         )
 
@@ -379,3 +402,10 @@ class MemoryApi:
 
     def write_uint8(self, addr: int, value: int) -> int:
         return self._memory.write_uint8(addr, value)
+
+    def search(self, value_to_search: bytes) -> List[int]:
+        """
+        Search for a sequence of bytes in memory. Returns a list of the
+        starting address of all nonoverlapping matches.
+        """
+        return self._memory.search(value_to_search)

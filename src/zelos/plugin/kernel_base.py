@@ -18,12 +18,12 @@
 # ======================================================================
 import ctypes
 import logging
-import sys
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from termcolor import colored
 
+from zelos.breakpoints import BreakState
 from zelos.hooks import HookType
 
 
@@ -59,12 +59,10 @@ def str2struct(struct_obj, data):
     ctypes.memmove(ctypes.addressof(struct_obj), data, fit)
 
 
-class SyscallManager(object):
+class IKernel(object):
     def __init__(self, engine):
         self.logger = logging.getLogger(__name__)
         self.z = engine
-
-        self.strace_file = sys.stdout
 
         self.breakpoints = set()
 
@@ -72,6 +70,9 @@ class SyscallManager(object):
         # provide argument information for syscall breakpoints.
         self.last_syscall_args = None
         self.last_retval = 0
+        # Set if in the middle of executing the implementation of a
+        # syscall
+        self._current_syscall = None
 
         # If this is set, engine will set the IP value after breaking
         # execution. This is needed to avoid an issue in Unicorn wherein
@@ -80,9 +81,15 @@ class SyscallManager(object):
 
         self.syscall_break_name = None
 
+        self.should_print_syscalls = True
+
     @property
     def emu(self):
         return self.z.current_process.emu
+
+    @property
+    def trace_file(self):
+        return self.z.plugins.trace.trace_file
 
     def set_breakpoint(self, syscall_name):
         self.breakpoints.add(syscall_name)
@@ -115,7 +122,9 @@ class SyscallManager(object):
             self.syscall_break_name = syscall_name
             self.z.scheduler.stop("syscall breakpoint")
 
-    def generate_break_state(self):
+    def generate_break_state(self) -> Optional[BreakState]:
+        if self.z.current_thread is None:
+            return None
         if self.syscall_break_name is None:
             syscall = None
         else:
@@ -136,15 +145,14 @@ class SyscallManager(object):
             "bits": self.z.state.bits,
         }
 
-    def set_strace_file(self, filename):
-        self.strace_file = self.z.files.unsafe_open(filename, "w")
-
     def print(self, string, max_len=1000):
         """
         Used to print additional debug information within a syscall.
         Will not appear in the strace.
         """
-        if not self.z.trace.should_print_thread():
+        if not self.z.plugins.trace.should_print_thread():
+            return
+        if not self.should_print_syscalls:
             return
         if len(string) > max_len:
             string = str(string[:max_len]) + "..."
@@ -153,52 +161,19 @@ class SyscallManager(object):
 
     def print_info(self, string):
         """Used to print auxiliary information to the strace file"""
-        if not self.z.trace.should_print_thread():
+        if not self.z.plugins.trace.should_print_thread():
             return
-        if self.strace_file is sys.stdout:
+        if self.trace_file is None:
             s = (
                 colored(f"[{self.z.current_thread.name}]", "magenta")
                 + " "
                 + colored(f"[INFO]", "white")
                 + f" {string}"
             )
+            print(s)
         else:
             s = f"[{self.z.current_thread.name}] " + f"[INFO] {string}"
-        print(s, file=self.strace_file, flush=True)
-
-    def print_syscall(self, thread, syscall_name, args, retval):
-        """
-        Prints information regarding a syscall for the strace.
-        Note, this may not immediately print the syscall (may need to
-        wait for return value
-        """
-        self.z.triggers.tr_syscall(thread, syscall_name, args, "Unknown")
-
-        if not self.z.trace.should_print_thread(thread):
-            return
-
-        retstr = "void" if retval is None else f"{retval:x}"
-
-        if args is None:
-            self.z.logger.warning("Syscall did not call get_args")
-
-        if self.strace_file is sys.stdout:
-            s = (
-                colored(f"[{thread.name}]", "magenta")
-                + " "
-                + colored(f"[SYSCALL]", "red")
-                + " "
-                + colored(f"{syscall_name}", "white", attrs=["bold"])
-                + f" ( {args} ) -> {retstr}"
-            )
-        else:
-            ip = thread.getIP()
-            s = (
-                f"[{thread.name}] "
-                f"[0x{ip:x}] {syscall_name} ( {args} ) -> {retstr}"
-            )
-
-        print(s, file=self.strace_file, flush=True)
+            print(s, file=self.trace_file, flush=True)
 
     def handle_syscall(self, process):
         """
@@ -207,27 +182,34 @@ class SyscallManager(object):
         """
         sys_num = self.get_syscall_number()
         sys_name = self.find_syscall_name_by_number(sys_num)
-        self.z.triggers.tr_call_syscall(sys_name)
-        self.logger.spam(f"Executing syscall {sys_name}")
         sys_fn = self.find_syscall(sys_name)
+
+        # The current thread might get modified by the syscall.
+        thread = self.z.current_thread
+        self.last_syscall_args = None
+        self._current_syscall = sys_name
         try:
-            # The current thread might get modified by the syscall.
-            thread = self.z.current_thread
-            self.last_syscall_args = None
             retval = sys_fn(self, process)
-            if retval is not None:
-                self.set_return_value(retval)
-            self.print_syscall(
-                thread, sys_name, self.last_syscall_args, retval
-            )
         except Exception as e:
-            self.logger.error(f"Error happened inside syscall {sys_name}")
-            self.print_syscall(thread, sys_name, self.last_syscall_args, None)
+            self._current_syscall = None
+            self.logger.error(
+                (
+                    f"Error in thread {thread} while executing "
+                    f"syscall {sys_name} Args: {self.last_syscall_args}"
+                )
+            )
             raise e
+        self._current_syscall = None
+        if retval is not None:
+            self.set_return_value(retval)
 
         hooks = self.z.hook_manager._get_hooks(HookType.SYSCALL.AFTER)
         for hook in hooks:
             hook(self.z.api, sys_name, self.last_syscall_args, retval)
+
+        self.z.feeds._handle_syscall_feed(
+            self.z.api, sys_name, self.last_syscall_args, retval
+        )
 
         self.last_retval = retval
         self._handle_syscall_break(sys_name)
@@ -248,8 +230,8 @@ class SyscallManager(object):
         for sys_name, overrides in override_dict.items():
             sys_func = self._name2syscall_func[sys_name]
 
-            def sys_func_wrapper(sm, p):
-                retval = sys_func(sm, p)
+            def sys_func_wrapper(k, p):
+                retval = sys_func(k, p)
                 if len(overrides) > 0:
                     self.logger.info("Invoking sysfunc return override")
                     return overrides.pop(0)
@@ -301,7 +283,7 @@ class SyscallManager(object):
     def return_addr(self):
         raise NotImplementedError()
 
-    def nullsub(self, sm, p):
+    def nullsub(self, k, p):
         return
 
     def fixme(self, msg):

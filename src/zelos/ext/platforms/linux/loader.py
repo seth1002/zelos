@@ -15,9 +15,11 @@
 # <http://www.gnu.org/licenses/>.
 # ======================================================================
 
+import posixpath
+
 from os.path import basename
 
-from unicorn import UC_ERR_EXCEPTION
+from zebracorn import UC_ERR_EXCEPTION
 
 from zelos.exceptions import ZelosLoadException
 from zelos.hooks import HookType
@@ -31,6 +33,13 @@ class LinuxMode:
         self.logger = z.logger
         self.z.hook_manager.register_exception_hook(self.handle_exception)
 
+        if arch == "x86_64":
+            stack_min = 0x00007F0000000000
+            stack_max = 0x00007FFF00000000
+        else:
+            stack_min = 0xFF000000
+            stack_max = 0xFFFF0000
+
         # TODO: removing this fails
         #       test.test_linux_arm.ZelosTest.test_dynamic_elf
         #       due to the stack being allocated at the same address as
@@ -40,8 +49,8 @@ class LinuxMode:
         if arch != "mips":
 
             def set_stack_region(current_process):
-                current_process.threads.stack_min = 0xFF000000
-                current_process.threads.stack_max = 0xFFFF0000
+                current_process.threads.stack_min = stack_min
+                current_process.threads.stack_max = stack_max
 
             self.z.hook_manager.register_process_hook(
                 HookType.PROCESS.CREATE, set_stack_region
@@ -52,8 +61,9 @@ class LinuxMode:
     def handle_exception(self, p, e):
         # TODO(kzsnow): This goes in core?
         try:
-            self.z.trace.bb(
-                self.z.last_instruction, self.z.last_instruction_size
+            self.z.plugins.trace.bb(
+                self.z.plugins.trace.last_instruction,
+                self.z.plugins.trace.last_instruction_size,
             )
         except Exception:
             self.z.logger.exception("Couldn't print basic block")
@@ -67,10 +77,10 @@ class LinuxMode:
 
         if self.z.state.arch == "arm":
             arm_private_syscall = {
-                0xFFFF0F60: self.z.zos.syscall_manager._kuser_cmpxchg64,
-                0xFFFF0FA0: self.z.zos.syscall_manager._kuser_memory_barrier,
-                0xFFFF0FC0: self.z.zos.syscall_manager._kuser_cmpxchg,
-                0xFFFF0FE0: self.z.zos.syscall_manager._kuser_get_tls,
+                0xFFFF0F60: self.z.kernel._kuser_cmpxchg64,
+                0xFFFF0FA0: self.z.kernel._kuser_memory_barrier,
+                0xFFFF0FC0: self.z.kernel._kuser_cmpxchg,
+                0xFFFF0FE0: self.z.kernel._kuser_get_tls,
             }.get(p.current_thread.getIP(), None)
             if arm_private_syscall is not None:
                 arm_private_syscall()
@@ -79,20 +89,12 @@ class LinuxMode:
             if self._attempt_to_handle_syscall():
                 return  # linear execution after syscall (interrupt style)
 
-        self.z.trace.bb()
+        self.z.plugins.trace.bb()
         p.threads.fail_current_thread(fail_reason=f"Exception {e}")
         self.z.processes.handles.close_all(self.z.current_process.pid)
 
     def _attempt_to_handle_syscall(self):
-        if self.z.verbose:
-            self.z.trace.bb(
-                self.z.last_instruction,
-                self.z.last_instruction_size,
-                full_trace=False,
-            )
-        syscall_action = self.z.zos.syscall_manager.handle_syscall(
-            self.z.current_process
-        )
+        syscall_action = self.z.kernel.handle_syscall(self.z.current_process)
         was_handled = syscall_action is not None
         return was_handled
 
@@ -166,24 +168,19 @@ class ElfLoader(Loader):
             module_name
         )
         data = bytearray(elf.Data)
-        base = self.memory._alloc_at(
-            "",
-            "main",
-            basename(normalized_module_name),
-            elf.ImageBase,
+        base = self.memory.map_anywhere(
             elf.VirtualSize,
+            preferred_address=elf.ImageBase,
+            name="",
+            kind="main",
+            module_name=basename(normalized_module_name),
         )
         self.memory.write(base, bytes(data))
         # Set proper permissions for each section of the module
         for s in elf.Sections:
             try:
                 self.memory.protect(
-                    s.Address,
-                    align(s.VirtualSize, s.Alignment),
-                    s.Permissions,
-                    # s.Name,
-                    # "main",
-                    # module_name=basename(module_path),
+                    s.Address, align(s.VirtualSize, s.Alignment), s.Permissions
                 )
             except Exception:
                 raise ZelosLoadException(
@@ -218,7 +215,10 @@ class ElfLoader(Loader):
         #   https://github.com/torvalds/linux/blob/v3.19/include/uapi/linux/auxvec.h
 
         module_path_ptr, str_len = self.memory.heap.allocstr(
-            f"/home/admin/{self.main_module_name}", alloc_name="Module Path"
+            posixpath.join(
+                self._z.config.virtual_path, self._z.config.virtual_filename
+            ),
+            alloc_name="Module Path",
         )
         cpu_string_ptr, _ = self.memory.heap.allocstr(
             "some computer", alloc_name="cpu_string"
@@ -230,7 +230,10 @@ class ElfLoader(Loader):
 
         env_strings = [f"{k}={v}\x00" for k, v in env_vars.items()]
         env_strings.extend(
-            [x + "\x00" for x in self.process.environment_variables]
+            [
+                f"{k}={v}\x00"
+                for k, v in self.process.environment_variables.items()
+            ]
         )
         arg_strings = [s + "\x00" for s in self.process.cmdline_args]
 

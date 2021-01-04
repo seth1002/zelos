@@ -27,10 +27,10 @@ from zelos import CommandLineOption
 from zelos.hooks import HookType
 from zelos.plugin import OSPlugin
 
+from .kernel import construct_kernel
 from .loader import ElfLoader, LinuxMode
 from .parse import LiefELF
 from .signals import Signals
-from .syscall_manager import construct_syscall_manager
 
 
 CommandLineOption(
@@ -66,6 +66,8 @@ class Linux(OSPlugin):
         }[binary.header.machine_type]
         if not self.initial_parse:
             self._first_parse_setup(arch)
+        if self.z.config.virtual_filename is None:
+            self.z.config.virtual_filename = os.path.basename(path)
         emulated_path = self._get_emulated_path(self.z.config, path)
         if self.z is not None:
             self.z.cmdline_args.insert(0, emulated_path)
@@ -110,7 +112,7 @@ class Linux(OSPlugin):
         )
 
     def _first_parse_setup(self, arch):
-        self.z.zos.syscall_manager = construct_syscall_manager(arch, self.z)
+        self.z.kernel = construct_kernel(arch, self.z)
 
         # On first parse, register process & thread creation hooks
         LinuxMode(arch, self.z)
@@ -126,7 +128,7 @@ class Linux(OSPlugin):
         if self.z.config.virtual_path is None:
             self.z.config.virtual_path = "/home/admin/zelos_dir/"
 
-        self.z.files.setup(self.z.config.virtual_path)
+        self.z.files.setup(posixpath.abspath(self.z.config.virtual_path))
 
         rootfs = {}
         for s in self.z.config.linux_rootfs:

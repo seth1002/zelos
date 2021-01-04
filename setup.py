@@ -48,11 +48,12 @@ INSTALL_REQUIRES = [
     "configargparse==0.15.1",
     "pypacker==4.9",
     "lief>=0.9.0",
-    "unicorn==1.0.2rc1",
+    "zebracorn==0.0.1",
+    "lark-parser==0.7.8",
 ]
 EXTRAS_REQUIRE = {
     "docs": [
-        "sphinx",
+        "sphinx==2.4.4",
         "sphinx_rtd_theme",
         "sphinxcontrib-apidoc",
         "recommonmark",
@@ -62,8 +63,12 @@ EXTRAS_REQUIRE = {
         "coverage",
         "hypothesis",
         "pympler",
+        "pytest-cov",
         "pytest>=4.3.0",
         "pytest-xdist",
+        "filelock",
+        "yara-python",
+        "mock",
     ],
 }
 EXTRAS_REQUIRE["dev"] = (

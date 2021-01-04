@@ -17,9 +17,11 @@
 import os
 import unittest
 
+from io import StringIO
 from os import path
+from unittest.mock import patch
 
-from zelos import HookType, Zelos
+from zelos import Zelos
 
 
 DATA_DIR = path.join(path.dirname(path.abspath(__file__)), "data")
@@ -28,8 +30,7 @@ DATA_DIR = path.join(path.dirname(path.abspath(__file__)), "data")
 class ZelosTest(unittest.TestCase):
     def test_static_elf_el(self):
         z = Zelos(path.join(DATA_DIR, "static_elf_mipsel_mti_helloworld"))
-        z.internal_engine.set_hook_granularity(HookType.EXEC.BLOCK)
-        z.internal_engine.start(timeout=10)
+        z.start(timeout=10)
 
         self.assertEqual(
             1, len(z.internal_engine.thread_manager.completed_threads)
@@ -41,9 +42,22 @@ class ZelosTest(unittest.TestCase):
                 "Skipping `test_static_elf_eb`: Windows lief fails to parse"
             )
         z = Zelos(path.join(DATA_DIR, "static_elf_mipseb_mti_helloworld"))
-        z.internal_engine.set_hook_granularity(HookType.EXEC.BLOCK)
-        z.internal_engine.start(timeout=10)
+        z.start(timeout=10)
 
+        self.assertEqual(
+            1, len(z.internal_engine.thread_manager.completed_threads)
+        )
+
+    def test_linux_errno(self):
+        if os.name == "nt":
+            raise unittest.SkipTest(
+                "Skipping `test_linux_errno`: Windows lief fails to parse"
+            )
+        z = Zelos(path.join(DATA_DIR, "errno_mips_example"), trace_off=True)
+
+        with patch("sys.stdout", new=StringIO()) as stdout:
+            z.start(timeout=10)
+            self.assertIn("Errno: 2", stdout.getvalue())
         self.assertEqual(
             1, len(z.internal_engine.thread_manager.completed_threads)
         )

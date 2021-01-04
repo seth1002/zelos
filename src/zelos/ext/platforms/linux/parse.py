@@ -22,10 +22,10 @@ import zelos.util as util
 
 from zelos.exceptions import UnsupportedBinaryError
 from zelos.file_system import FileSystem
-from zelos.plugin import Parser, Section
+from zelos.plugin import ParsedBinary, Section
 
 
-class LiefELF(Parser):
+class LiefELF(ParsedBinary):
     def __init__(self, file_system: FileSystem, path: str, binary):
         super().__init__()
         self._files = file_system
@@ -82,6 +82,16 @@ class LiefELF(Parser):
         return (linker_path, linker_binary)
 
     def parse(self, path, binary):
+        # Get symbols for the target dynamic binary before we replace
+        # it with the loader in the loading process. Keep in mind,
+        # these still need to be relocated.
+        # TODO: Need OS agnostic place to put this information
+        self._elf_dynamic_import_addrs = {
+            x.symbol.name: x.address for x in binary.pltgot_relocations
+        }
+        self._target_entrypoint = binary.entrypoint
+        self._target_imagebase = binary.imagebase
+
         interpreter = self._get_interpreter(binary)
         if interpreter is not None:
             # TODO: automatically do setup to run dynamic linux binaries

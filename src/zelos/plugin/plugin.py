@@ -23,6 +23,8 @@ from collections import defaultdict
 from os.path import isabs
 from typing import Callable
 
+import pkg_resources
+
 import zelos.ext.platforms
 import zelos.ext.plugins
 
@@ -41,8 +43,10 @@ class IPlugin(IManager):
         self.zelos = zelos
 
     def __init_subclass__(cls, **kwargs):
-        Plugins.loaded_plugins.append(cls)
         super().__init_subclass__(**kwargs)
+        name = getattr(cls, "NAME", cls.__name__.lower())
+        file_and_name = inspect.getfile(cls) + "::" + name
+        Plugins.loaded_plugins[file_and_name] = cls
 
 
 plugins_loaded = set()
@@ -52,6 +56,12 @@ def load(paths):
     """Loads the plugins that are located in the plugins directory."""
     global plugins_loaded
 
+    # Load plugins/commands exported via `entry_point`
+    [
+        entry_point.load()
+        for entry_point in pkg_resources.iter_entry_points("zelos.plugins")
+    ]
+
     # Load plugins that come with zelos
     paths += zelos.ext.plugins.__path__._path
     paths += zelos.ext.platforms.__path__._path
@@ -60,9 +70,15 @@ def load(paths):
     if len(paths) == 0:
         return
 
+    modules_to_load = []
     for finder, name, _ in pkgutil.iter_modules(paths):
+        found_module = finder.find_module(name)
+        modules_to_load.append((name, found_module))
+
+    for (name, module) in sorted(modules_to_load, key=lambda x: x[0]):
         try:
-            _ = finder.find_module(name).load_module(name)
+            _ = module.load_module(name)
+
         except Exception as e:
             logging.getLogger(__name__).exception(
                 f"Could not load plugin at '{name}': {e}"
@@ -75,7 +91,7 @@ class Plugins:
     Plugins are set as attributes of this class for convenience.
     """
 
-    loaded_plugins = []
+    loaded_plugins = {}
 
     def __init__(self, zelos, paths):
         self.registered_plugins = {}
@@ -83,7 +99,8 @@ class Plugins:
         load(paths)
         self._zelos = zelos
 
-        for p in self.loaded_plugins:
+    def initialize(self):
+        for p in self.loaded_plugins.values():
             self.register_plugin(p)
         print(f"Plugins: {', '.join(self.registered_plugins.keys())}")
 
@@ -93,6 +110,14 @@ class Plugins:
         name = getattr(plugin_class, "NAME", plugin_class.__name__.lower())
         plugin = plugin_class(self._zelos)
         self.registered_plugins[name] = plugin
+        if hasattr(self, name):
+            self.logger.error(
+                (
+                    f'There are two plugins with the name "{name}"'
+                    "Trying to use these plugin will be difficult."
+                    "Consider renaming one of these plugins."
+                )
+            )
         setattr(self, name, plugin)
         self.logger.debug(f"Successfully registered plugin '{name}'")
 
@@ -109,7 +134,8 @@ class OSPlugin:
         self.logger = self.z.logger
 
     def __init_subclass__(cls, **kwargs):
-        OSPlugins.unregistered_os_plugins.append(cls)
+        name = getattr(cls, "NAME", cls.__name__.lower())
+        OSPlugins.unregistered_os_plugins[name] = cls
 
     def parse(self, *args, **kwargs):
         raise NotImplementedError
@@ -119,7 +145,7 @@ class OSPlugin:
 
 
 class OSPlugins:
-    unregistered_os_plugins = []
+    unregistered_os_plugins = {}
 
     def __init__(self, z):
         self.logger = z.logger
@@ -128,11 +154,8 @@ class OSPlugins:
         self.chosen_os = None
 
     def _register_plugins(self, z):
-        for p in self.unregistered_os_plugins:
+        for name, p in self.unregistered_os_plugins.items():
             self._registered_os_plugins.append(p(z))
-            name = p.__name__.lower()
-            if hasattr(p, "NAME"):
-                name = p.NAME
             self.logger.debug(
                 f"Successfully registered platform plugin '{name}'"
             )
@@ -203,7 +226,8 @@ class CommandLineOption:
     """
 
     def __init__(self, name, **kwargs):
-        stack = inspect.stack()
-        frame = stack[1]
+        previous_stack_frame = inspect.currentframe().f_back
 
-        PluginCommands.registered_flags[frame.filename][name] = kwargs
+        filename = previous_stack_frame.f_globals["__file__"]
+
+        PluginCommands.registered_flags[filename][name] = kwargs

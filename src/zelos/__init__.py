@@ -14,7 +14,7 @@
 # License along with this program.  If not, see
 # <http://www.gnu.org/licenses/>.
 # ======================================================================
-__version__ = "0.0.2.dev0"
+__version__ = "0.2.1.dev0"
 
 __title__ = "zelos"
 __description__ = "A comprehensive binary emulation platform."
@@ -26,14 +26,15 @@ __author__ = "Zeropoint Dynamics"
 __email__ = "zelos@zeropointdynamics.com"
 
 __license__ = "AGPLv3"
-__copyright__ = "Copyright (c) 2019 Zeropoint Dynamics"
+__copyright__ = "Copyright (c) 2017-2020 Zeropoint Dynamics"
 
 import os
 import sys
 
 import colorama
 
-from .api.zelos_api import Zelos
+from .api.zelos_api import Zelos, ZelosCmdline
+from .emulator.base import MemoryRegion
 from .engine import Engine
 from .exceptions import (
     InvalidHookTypeException,
@@ -51,6 +52,7 @@ from .plugin import CommandLineOption, IPlugin, ISubcommand
 
 __all__ = [
     "Zelos",
+    "ZelosCmdline",
     "Engine",
     "ZelosException",
     "ZelosLoadException",
@@ -64,6 +66,7 @@ __all__ = [
     "CommandLineOption",
     "HookType",
     "ProtType",
+    "MemoryRegion",
 ]
 
 """ Initialize colorama only once """

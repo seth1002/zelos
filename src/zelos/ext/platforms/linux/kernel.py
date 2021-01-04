@@ -24,33 +24,32 @@ from termcolor import colored
 
 from zelos import HookType
 from zelos.exceptions import ZelosException
-from zelos.plugin import ArgFactory, SyscallManager
+from zelos.plugin import ArgFactory, IKernel
 
+from .syscalls import syscall_utils as sys_utils
 from .syscalls.arg_strings import get_arg_string
 
 
-def construct_syscall_manager(arch, z):
-    sm_class = {
-        "x86": X86SyscallManager,
-        "x86_64": X86_64SyscallManager,
-        "arm": ARMSyscallManager,
-        "mips": MIPSSyscallManager,
+def construct_kernel(arch, z):
+    kernel_class = {
+        "x86": X86Kernel,
+        "x86_64": X86_64Kernel,
+        "arm": ARMKernel,
+        "mips": MIPSKernel,
     }.get(arch, None)
 
-    if sm_class is None:
+    if kernel_class is None:
         return None
-    return sm_class(z)
+    return kernel_class(z)
 
 
-class LinuxSyscallManager(SyscallManager):
+class LinuxKernel(IKernel):
     def __init__(self, arch, engine):
-        super(LinuxSyscallManager, self).__init__(engine)
+        super(LinuxKernel, self).__init__(engine)
         self.arch = arch
         self.call_map = self.__load_linux_syscall_maps(arch)
         self._name2syscall_func = self._load_linux_syscall_funcs()
         self.rev_map = {v: k for k, v in self.call_map.items()}
-
-        self.offset_dict = defaultdict(int)
 
         self.arg_factory = ArgFactory(
             functools.partial(get_arg_string, self.z)
@@ -131,13 +130,16 @@ class LinuxSyscallManager(SyscallManager):
                 [("int", "call"), ("unsigned long *", "callargs")],
                 sys_num=sys_num,
             )
-        status = super(LinuxSyscallManager, self).handle_syscall(process)
+        status = super(LinuxKernel, self).handle_syscall(process)
         if sys_name == "socketcall":
             socketcall = self.socketcall_dict.get(args.call, None)
             if socketcall is not None:
                 self.last_syscall_args = socketcall_args
                 self._handle_syscall_break(socketcall)
         return status
+
+    def set_errno(self, val):
+        pass
 
     def _get_socketcall_args(
         self, process, func_name, args_addr, arg_list, arg_string_overrides={}
@@ -160,7 +162,7 @@ class LinuxSyscallManager(SyscallManager):
 
     def _print_socket_syscall(self, func_name, args):
         s = colored(f"{func_name}", "white", attrs=["bold"]) + f" ( {args} )"
-        self.z.trace.print("SOCKET SYSCALL", s)
+        self.z.plugins.trace.print("SOCKET SYSCALL", s)
 
     ####################
     # HELPER FUNCTIONS #
@@ -191,9 +193,9 @@ class LinuxSyscallManager(SyscallManager):
         return args
 
 
-class X86SyscallManager(LinuxSyscallManager):
+class X86Kernel(LinuxKernel):
     def __init__(self, engine):
-        super(X86SyscallManager, self).__init__("x86", engine)
+        super(X86Kernel, self).__init__("x86", engine)
 
         def syscall_handler_wrapper(current_process, *args, **kwargs):
             self.handle_syscall(current_process)
@@ -214,39 +216,19 @@ class X86SyscallManager(LinuxSyscallManager):
         self.emu.set_reg("eax", value)
 
     def return_addr(self):
-        return self.emu.getIP() + 2
-
-    def handle_syscall(self, *args, **kwargs):
-        """
-        Calls the corresponding syscall with given name or number.
-        """
-        t = self.z.current_process.current_thread
-        addr = t.getIP()
-
-        super(X86SyscallManager, self).handle_syscall(*args, **kwargs)
-
-        if self.syscall_break_name is None:
-
-            def set_ip():
-                t.setIP(addr + 2)
-
-            self.z.scheduler.stop_and_exec("handle_syscall", set_ip)
-        else:
-            self.pending_ip_change = addr + 2
-
-        return True
+        return self.emu.getIP()
 
 
-class X86_64SyscallManager(LinuxSyscallManager):
+class X86_64Kernel(LinuxKernel):
     def __init__(self, engine):
-        super(X86_64SyscallManager, self).__init__("x86_64", engine)
+        super(X86_64Kernel, self).__init__("x86_64", engine)
 
         def handle_syscall_callback(zelos):
             current_process = engine.current_process
             """
             We need to execute a syscall at this point, however,
             certain syscalls may not be runnable within a hook (they
-            cause unicorn to execute code which is not allowed in a
+            cause zebracorn to execute code which is not allowed in a
             hook)
             """
             handle_syscall_closure = functools.partial(
@@ -288,6 +270,11 @@ class X86_64SyscallManager(LinuxSyscallManager):
     def set_return_value(self, value):
         self.emu.set_reg("rax", value)
 
+    def set_errno(self, val: int):
+        fs_base = sys_utils.get_fs(self.z.current_process)
+        errno_location = fs_base - 0x80
+        self.z.memory.write_int(errno_location, val)
+
     def return_addr(self):
         return self.emu.getIP() + 2
 
@@ -300,9 +287,9 @@ class X86_64SyscallManager(LinuxSyscallManager):
         return
 
 
-class ARMSyscallManager(LinuxSyscallManager):
+class ARMKernel(LinuxKernel):
     def __init__(self, engine):
-        super(ARMSyscallManager, self).__init__("arm", engine)
+        super(ARMKernel, self).__init__("arm", engine)
 
         def syscall_handler_wrapper(current_process, *args, **kwargs):
             self.handle_syscall(current_process)
@@ -388,9 +375,9 @@ class ARMSyscallManager(LinuxSyscallManager):
         self.emu.setIP(self.emu.get_reg("lr"))
 
 
-class MIPSSyscallManager(LinuxSyscallManager):
+class MIPSKernel(LinuxKernel):
     def __init__(self, engine):
-        super(MIPSSyscallManager, self).__init__("mips", engine)
+        super(MIPSKernel, self).__init__("mips", engine)
 
         def syscall_handler_wrapper(current_process, *args, **kwargs):
             self.handle_syscall(current_process)
@@ -405,18 +392,17 @@ class MIPSSyscallManager(LinuxSyscallManager):
     _REG_RETURN_2 = "v1"
 
     def handle_syscall(self, *args, **kwargs):
-        super(MIPSSyscallManager, self).handle_syscall(*args, **kwargs)
+        super(MIPSKernel, self).handle_syscall(*args, **kwargs)
 
-        return_address = self.emu.getIP() + 4
-
-        if self.syscall_break_name is None:
-
-            def set_ip():
-                self.emu.setIP(return_address)
-
-            self.z.scheduler.stop_and_exec("handle_syscall", set_ip)
+        # Mimicking qemu user behavior (specifically -1133)
+        # github.com/qemu/qemu/blob/master/linux-user/mips/cpu_loop.c
+        unsigned_neg1 = 2 ** (self.z.state.bytes * 8) - 1
+        retval = self.get_return_value()
+        if unsigned_neg1 >= retval >= (-1133 & unsigned_neg1):
+            self.emu.set_reg("a3", 1)
+            self.set_return_value(-retval)
         else:
-            self.pending_ip_change = return_address
+            self.emu.set_reg("a3", 0)
 
         return True
 
@@ -425,6 +411,9 @@ class MIPSSyscallManager(LinuxSyscallManager):
 
     def set_return_value(self, value):
         self.emu.set_reg("v0", value)
+
+    def get_return_value(self):
+        return self.emu.get_reg("v0")
 
     def return_addr(self):
         return self.emu.getIP()

@@ -26,20 +26,23 @@ DATA_DIR = path.join(path.dirname(path.abspath(__file__)), "data")
 
 
 class ZelosTest(unittest.TestCase):
-    def test_static_elf_verbose(self):
-        z = Zelos(path.join(DATA_DIR, "static_elf_arm_helloworld"))
-        z.internal_engine.set_verbose(True)
-        z.internal_engine.trace.threads_to_print.add("none")
-        z.internal_engine.start(timeout=3)
+    def test_static_elf_inst_feed(self):
+        z = Zelos(
+            path.join(DATA_DIR, "static_elf_arm_helloworld"),
+            trace_off=True,
+            inst_feed=True,
+        )
+        z.start(timeout=3)
 
         self.assertEqual(
             1, len(z.internal_engine.thread_manager.completed_threads)
         )
 
     def test_static_elf(self):
-        z = Zelos(path.join(DATA_DIR, "static_elf_arm_helloworld"))
-        z.internal_engine.trace.threads_to_print.add("none")
-        z.internal_engine.start(timeout=10)
+        z = Zelos(
+            path.join(DATA_DIR, "static_elf_arm_helloworld"), trace_off=True
+        )
+        z.start(timeout=10)
 
         self.assertEqual(
             1, len(z.internal_engine.thread_manager.completed_threads)
@@ -51,9 +54,10 @@ class ZelosTest(unittest.TestCase):
                 "Skipping `test_dynamic_elf`: "
                 "Windows fatal exception: access violation"
             )
-        z = Zelos(path.join(DATA_DIR, "dynamic_elf_arm_helloworld"))
-        z.internal_engine.trace.threads_to_print.add("none")
-        z.internal_engine.start(timeout=10)
+        z = Zelos(
+            path.join(DATA_DIR, "dynamic_elf_arm_helloworld"), trace_off=True
+        )
+        z.start(timeout=10)
 
         self.assertEqual(
             1, len(z.internal_engine.thread_manager.completed_threads)

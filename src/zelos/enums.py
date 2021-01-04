@@ -1,6 +1,6 @@
 from enum import Enum, IntEnum, auto
 
-from unicorn import (
+from zebracorn import (
     UC_PROT_ALL,
     UC_PROT_EXEC,
     UC_PROT_NONE,
@@ -23,8 +23,19 @@ class HookType:
     class MEMORY(Enum):
         """
         Used by :py:meth:`zelos.Zelos.hook_memory` to specify the
-        memory event to hook on. View the registration function for more
-        details.
+        memory event to hook on. View the registration function for
+        more details.
+
+        INTERNAL_READ|INTERNAL_WRITE|INTERNAL_MAP are for hooking
+        reads|writes|maps that are done by Zelos (such as those done
+        within syscall implementations). Other read and writes only
+        hook memory accesses done by instructions executed in the
+        underlying emulator.
+
+        The callback for INTERNAL_MAP does not provide the data for the
+        mapping in the callback. This is because we didn't find an
+        efficient way to do so, causing a drastic slowdown for hooks
+        that didn't need the actual mapped data.
         """
 
         READ = auto()
@@ -40,6 +51,10 @@ class HookType:
         WRITE_INVALID = auto()
         INVALID = auto()
         VALID = auto()
+
+        INTERNAL_READ = auto()
+        INTERNAL_WRITE = auto()
+        INTERNAL_MAP = auto()
 
     class EXEC(Enum):
         """

@@ -32,8 +32,8 @@ from zelos.ext.platforms.linux.syscalls.syscalls_const import (
     SocketOptionsSocket,
     SocketOptionsTcp,
     SocketProtocol,
-    SocketType,
 )
+from zelos.handles import SocketHandle
 from zelos.util import dumpstruct, str2struct, struct2str
 
 from . import syscall_structs as structs
@@ -79,12 +79,21 @@ def _create_sockaddr_in(domain, host, port):
     return struct_bytes
 
 
-def _socket_linux_to_python(domain, type, protocol):
+def _socket_linux_to_python(k, domain, type, protocol):
     """
     Convert Linux socket domain, type and protocol constants into their
     equivalent python constants.
     """
     import socket
+
+    if k.arch == "mips":
+        from zelos.ext.platforms.linux.syscalls.syscalls_const import (
+            MipsSocketType as SocketType,
+        )
+    else:
+        from zelos.ext.platforms.linux.syscalls.syscalls_const import (
+            CommonSocketType as SocketType,
+        )
 
     domain_map = {
         SocketFamily.AF_INET: socket.AF_INET,
@@ -163,8 +172,8 @@ def _socktopt_linux_to_python(level, name):
     return (level, name)
 
 
-def socket(sm, p, args_addr):
-    args = sm._get_socketcall_args(
+def socket(k, p, args_addr):
+    args = k._get_socketcall_args(
         p,
         "socket",
         args_addr,
@@ -173,17 +182,19 @@ def socket(sm, p, args_addr):
 
     try:
         (domain, type, protocol) = _socket_linux_to_python(
-            args.domain, args.type, args.protocol
+            k, args.domain, args.type, args.protocol
         )
-        socket_handle_num = sm.z.network.create_socket(domain, type, protocol)
+        socket_handle_num = k.z.network.create_socket_handle(
+            domain, type, protocol
+        )
     except Exception as e:
         print("socket error :", e)
         return -1
     return socket_handle_num
 
 
-def bind(sm, p, args_addr):
-    args = sm._get_socketcall_args(
+def bind(k, p, args_addr):
+    args = k._get_socketcall_args(
         p,
         "bind",
         args_addr,
@@ -194,25 +205,28 @@ def bind(sm, p, args_addr):
         ],
     )
     _parse_sockaddr(p, args.addr, args.addrlen)
-    socket_handle = sm.z.handles.get(args.sockfd)
+    socket_handle = k.z.handles.get(args.sockfd)
+    if not isinstance(socket_handle, SocketHandle):
+        k.logger.error("Invalid socket handle")
+        return -1
     sock = socket_handle.socket
     addr = bytes(p.memory.read(args.addr, args.addrlen))
     (host, port) = get_host_and_port(sock.domain, addr)
-    sm.print(f"binding socket 0x{args.sockfd:x} to ({host}, {port})")
+    k.print(f"binding socket 0x{args.sockfd:x} to ({host}, {port})")
     return sock.bind((host, port))
 
 
-def connect(sm, p, args_addr):
+def connect(k, p, args_addr):
     def print_addr(args):
-        socket_handle = sm.z.handles.get(args.sockfd)
-        if socket_handle is None:
+        socket_handle = k.z.handles.get(args.sockfd)
+        if not isinstance(socket_handle, SocketHandle):
             return "{0}=0x{1:x}".format("addr", args.addr)
         sock = socket_handle.socket
         sockaddr = bytes(p.memory.read(args.addr, args.addrlen))
         (host, port) = get_host_and_port(sock.domain, sockaddr)
         return f"dest_addr=0x{args.addr:x} ({host}:{port})"
 
-    args = sm._get_socketcall_args(
+    args = k._get_socketcall_args(
         p,
         "connect",
         args_addr,
@@ -224,9 +238,9 @@ def connect(sm, p, args_addr):
         arg_string_overrides={"addr": print_addr},
     )
     # _parse_sockaddr(p, args.addr, args.addrlen)
-    socket_handle = sm.z.handles.get(args.sockfd)
-    if socket_handle is None:
-        sm.logger.error("Invalid socket handle")
+    socket_handle = k.z.handles.get(args.sockfd)
+    if not isinstance(socket_handle, SocketHandle):
+        k.logger.error("Invalid socket handle")
         return -1
     socket = socket_handle.socket
     addr = p.memory.read(args.addr, args.addrlen)
@@ -240,14 +254,14 @@ def connect(sm, p, args_addr):
     return status
 
 
-def listen(sm, p, args_addr):
-    args = sm._get_socketcall_args(
+def listen(k, p, args_addr):
+    args = k._get_socketcall_args(
         p, "listen", args_addr, [("int", "sockfd"), ("int", "backlog")]
     )
 
-    socket_handle = sm.z.handles.get(args.sockfd)
-    if socket_handle is None:
-        sm.logger.error("Invalid socket handle")
+    socket_handle = k.z.handles.get(args.sockfd)
+    if not isinstance(socket_handle, SocketHandle):
+        k.logger.error("Invalid socket handle")
         return -1
     socket = socket_handle.socket
 
@@ -256,8 +270,8 @@ def listen(sm, p, args_addr):
     return 0
 
 
-def accept(sm, p, args_addr):
-    args = sm._get_socketcall_args(
+def accept(k, p, args_addr):
+    args = k._get_socketcall_args(
         p,
         "accept",
         args_addr,
@@ -268,9 +282,9 @@ def accept(sm, p, args_addr):
         ],
     )
 
-    socket_handle = sm.z.handles.get(args.sockfd)
-    if socket_handle is None:
-        sm.logger.error("Invalid socket handle")
+    socket_handle = k.z.handles.get(args.sockfd)
+    if not isinstance(socket_handle, SocketHandle):
+        k.logger.error("Invalid socket handle")
         return -1
     socket = socket_handle.socket
 
@@ -279,8 +293,8 @@ def accept(sm, p, args_addr):
     return args.sockfd + 1
 
 
-def getsockname(sm, p, args_addr):
-    sm._get_socketcall_args(
+def getsockname(k, p, args_addr):
+    k._get_socketcall_args(
         p,
         "getsockname",
         args_addr,
@@ -293,8 +307,8 @@ def getsockname(sm, p, args_addr):
     return 0
 
 
-def getpeername(sm, p, args_addr):
-    sm._get_socketcall_args(
+def getpeername(k, p, args_addr):
+    k._get_socketcall_args(
         p,
         "getpeername",
         args_addr,
@@ -307,8 +321,8 @@ def getpeername(sm, p, args_addr):
     return 0
 
 
-def socketpair(sm, p, args_addr):
-    sm._get_socketcall_args(
+def socketpair(k, p, args_addr):
+    k._get_socketcall_args(
         p,
         "socketpair",
         args_addr,
@@ -322,12 +336,12 @@ def socketpair(sm, p, args_addr):
     return 0
 
 
-def send(sm, p, args_addr):
+def send(k, p, args_addr):
     def print_buf(args):
         s = repr(bytes(p.memory.read(args.buf, size=args.len)))[2:-1]
         return f'buf=0x{args.buf:x} ("{s}")'
 
-    args = sm._get_socketcall_args(
+    args = k._get_socketcall_args(
         p,
         "send",
         args_addr,
@@ -340,24 +354,24 @@ def send(sm, p, args_addr):
         arg_string_overrides={"buf": print_buf},
     )
     payload = p.memory.read(args.buf, args.len)
-    return _send(sm, p, args.sockfd, payload, args.flags)
+    return _send(k, p, args.sockfd, payload, args.flags)
 
 
-def sendto(sm, p, args_addr):
+def sendto(k, p, args_addr):
     def print_buf(args):
         s = repr(bytes(p.memory.read(args.buf, size=args.len)))[2:-1]
         return f'buf=0x{args.buf:x} ("{s}")'
 
     def print_dst(args):
-        socket_handle = sm.z.handles.get(args.sockfd)
-        if socket_handle is None:
+        socket_handle = k.z.handles.get(args.sockfd)
+        if not isinstance(socket_handle, SocketHandle):
             return "{0}=0x{1:x}".format("dest_addr", args.dest_addr)
         sock = socket_handle.socket
         sockaddr = bytes(p.memory.read(args.dest_addr, args.addrlen))
         (host, port) = get_host_and_port(sock.domain, sockaddr)
         return f"dest_addr=0x{args.dest_addr:x} ({host}:{port})"
 
-    args = sm._get_socketcall_args(
+    args = k._get_socketcall_args(
         p,
         "sendto",
         args_addr,
@@ -371,9 +385,9 @@ def sendto(sm, p, args_addr):
         ],
         arg_string_overrides={"buf": print_buf, "dest_addr": print_dst},
     )
-    socket_handle = sm.z.handles.get(args.sockfd)
-    if socket_handle is None:
-        sm.logger.notice(f"Could not find socket {args.sockfd}")
+    socket_handle = k.z.handles.get(args.sockfd)
+    if not isinstance(socket_handle, SocketHandle):
+        k.logger.notice(f"Could not find socket {args.sockfd}")
         return -1
     sock = socket_handle.socket
     sockaddr = bytes(p.memory.read(args.dest_addr, args.addrlen))
@@ -383,16 +397,16 @@ def sendto(sm, p, args_addr):
     if socket_handle.data.get("port", 0) == 53:
         target = dns.parse_dns_request(payload)
         if target is not None:
-            sm.print_info(f"DNS Request: {target}")
-            sm.z.network.add_attempted_connection(target, "sendto")
+            k.print_info(f"DNS Request: {target}")
+            k.z.network.add_attempted_connection(target, "sendto")
 
     return sock.sendto(payload, (host, port), args.flags)
 
 
-def _send(sm, p, sockfd, payload, flags=0):
-    socket_handle = sm.z.handles.get(sockfd)
-    if socket_handle is None:
-        sm.logger.notice(f"Invalid socket fd 0x{sockfd:x}")
+def _send(k, p, sockfd, payload, flags=0):
+    socket_handle = k.z.handles.get(sockfd)
+    if not isinstance(socket_handle, SocketHandle):
+        k.logger.notice(f"Invalid socket fd 0x{sockfd:x}")
         return -1
     sock = socket_handle.socket
     sent_len = sock.send(payload, flags)
@@ -400,14 +414,14 @@ def _send(sm, p, sockfd, payload, flags=0):
     if socket_handle.data.get("port", 0) == 53:
         target = dns.parse_dns_request(payload)
         if target is not None:
-            sm.print_info(f"DNS Request: {target}")
-            sm.z.network.add_attempted_connection(target, "sendto")
+            k.print_info(f"DNS Request: {target}")
+            k.z.network.add_attempted_connection(target, "sendto")
 
     return sent_len
 
 
-def recv(sm, p, args_addr):
-    args = sm._get_socketcall_args(
+def recv(k, p, args_addr):
+    args = k._get_socketcall_args(
         p,
         "recv",
         args_addr,
@@ -418,11 +432,11 @@ def recv(sm, p, args_addr):
             ("int", "flags"),
         ],
     )
-    return _recv(sm, p, args.sockfd, args.buf, args.len, args.flags)
+    return _recv(k, p, args.sockfd, args.buf, args.len, args.flags)
 
 
-def recvfrom(sm, p, args_addr):
-    args = sm._get_socketcall_args(
+def recvfrom(k, p, args_addr):
+    args = k._get_socketcall_args(
         p,
         "recvfrom",
         args_addr,
@@ -435,7 +449,10 @@ def recvfrom(sm, p, args_addr):
             ("socklen_t *", "addrlen"),
         ],
     )
-    socket_handle = sm.z.handles.get(args.sockfd)
+    socket_handle = k.z.handles.get(args.sockfd)
+    if not isinstance(socket_handle, SocketHandle):
+        k.logger.error("Invalid socket handle")
+        return -1
     sock = socket_handle.socket
 
     try:
@@ -447,33 +464,36 @@ def recvfrom(sm, p, args_addr):
         if len(data) > 0:
             p.memory.write(args.buf, data)
         return len(data)
+    except BlockingIOError as e:
+        k.set_errno(e.errno)
+        return -e.errno
     except Exception as e:
         print("[recvfrom] error: " + str(e))
         return -1
 
 
-def _recv(sm, p, sockfd, buf, _len, flags=0):
-    socket_handle = sm.z.handles.get(sockfd)
-    if socket_handle is None:
+def _recv(k, p, sockfd, buf, _len, flags=0):
+    socket_handle = k.z.handles.get(sockfd)
+    if not isinstance(socket_handle, SocketHandle):
         return -1
     sock = socket_handle.socket
     has_data = sock.peek()
     if has_data:
         data = sock.recv(_len, flags)
-        sm.print(f"received: '{data}'")
+        k.print(f"received: '{data}'")
         p.memory.write(buf, data)
         return len(data)
     return 0
 
 
-def shutdown(sm, p, args_addr):
-    sm._get_socketcall_args(
+def shutdown(k, p, args_addr):
+    k._get_socketcall_args(
         p, "shutdown", args_addr, [("int", "sockfd"), ("int", "how")]
     )
     return 0
 
 
-def setsockopt(sm, p, args_addr):
+def setsockopt(k, p, args_addr):
     arg_list = [
         ("int", "sockfd"),
         ("int", "level"),
@@ -481,11 +501,11 @@ def setsockopt(sm, p, args_addr):
         ("const void*", "optval"),
         ("socklen_t", "optlen"),
     ]
-    args = sm._get_socketcall_args(p, "setsockopt", args_addr, arg_list)
+    args = k._get_socketcall_args(p, "setsockopt", args_addr, arg_list)
 
-    socket_handle = sm.z.handles.get(args.sockfd)
-    if socket_handle is None:
-        sm.logger.error("Invalid socket handle")
+    socket_handle = k.z.handles.get(args.sockfd)
+    if not isinstance(socket_handle, SocketHandle):
+        k.logger.error("Invalid socket handle")
         return -1
     socket = socket_handle.socket
 
@@ -493,15 +513,16 @@ def setsockopt(sm, p, args_addr):
 
     try:
         (level, name) = _socktopt_linux_to_python(args.level, args.optname)
-        return socket.setsockopt(args.level, args.optname, optval)
+        socket.setsockopt(args.level, args.optname, optval)
+        return 0
     except Exception as e:
         print("[setsockopt] failed:", e)
 
     return 0
 
 
-def getsockopt(sm, p, args_addr):
-    sm._get_socketcall_args(
+def getsockopt(k, p, args_addr):
+    k._get_socketcall_args(
         p,
         "getsockopt",
         args_addr,
@@ -516,19 +537,19 @@ def getsockopt(sm, p, args_addr):
     return 0
 
 
-def sendmsg(sm, p, args_addr):
-    args = sm._get_socketcall_args(
+def sendmsg(k, p, args_addr):
+    args = k._get_socketcall_args(
         p,
         "sendmsg",
         args_addr,
         [("int", "sockfd"), ("const struct msghdr*", "msg"), ("int", "flags")],
     )
     msghdr = p.memory.readstruct(args.msg, structs.MSGHDR())
-    return _sendmsg(sm, p, args.sockfd, msghdr, args.flags)
+    return _sendmsg(k, p, args.sockfd, msghdr, args.flags)
 
 
-def sendmmsg(sm, p, args_addr):
-    args = sm._get_socketcall_args(
+def sendmmsg(k, p, args_addr):
+    args = k._get_socketcall_args(
         p,
         "sendmmsg",
         args_addr,
@@ -542,14 +563,14 @@ def sendmmsg(sm, p, args_addr):
     mmsg_addr = args.msgvec
     for i in range(args.vlen):
         msghdr = p.memory.readstruct(mmsg_addr, structs.MSGHDR())
-        bytes_sent = _sendmsg(sm, p, args.sockfd, msghdr, args.flags)
+        bytes_sent = _sendmsg(k, p, args.sockfd, msghdr, args.flags)
         msg_len_addr = mmsg_addr + ctypes.sizeof(msghdr)
         int_size = p.memory.write_int(msg_len_addr, bytes_sent)
         mmsg_addr += ctypes.sizeof(msghdr) + int_size
     return args.vlen
 
 
-def _sendmsg(sm, p, sockfd, msghdr, flags):
+def _sendmsg(k, p, sockfd, msghdr, flags):
     dumpstruct(msghdr)
 
     iovec_array = p.memory.readstructarray(
@@ -560,13 +581,13 @@ def _sendmsg(sm, p, sockfd, msghdr, flags):
     for iovec in iovec_array:
         gathered_results += p.memory.read(iovec.iov_base, iovec.iov_len)
 
-    sent_len = _send(sm, p, sockfd, gathered_results, flags)
+    sent_len = _send(k, p, sockfd, gathered_results, flags)
 
     return sent_len
 
 
-def recvmsg(sm, p, args_addr):
-    sm._get_socketcall_args(
+def recvmsg(k, p, args_addr):
+    k._get_socketcall_args(
         p,
         "recvmsg",
         args_addr,
@@ -575,8 +596,8 @@ def recvmsg(sm, p, args_addr):
     return 0
 
 
-def accept4(sm, p, args_addr):
-    sm._get_socketcall_args(
+def accept4(k, p, args_addr):
+    k._get_socketcall_args(
         p,
         "accept4",
         args_addr,
@@ -590,8 +611,8 @@ def accept4(sm, p, args_addr):
     return 0
 
 
-def recvmmsg(sm, p, args_addr):
-    sm._get_socketcall_args(
+def recvmmsg(k, p, args_addr):
+    k._get_socketcall_args(
         p,
         "recvmmsg",
         args_addr,

@@ -16,6 +16,8 @@ Zelos Documentation
   tutorials/03_using_hooks
   tutorials/04_writing_plugins
   tutorials/05_syscall_limit_plugin
+  tutorials/06_snapshot_overlay
+  tutorials/07_zml_and_feeds
 
 
 .. toctree::

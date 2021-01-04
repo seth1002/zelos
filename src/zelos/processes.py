@@ -18,12 +18,13 @@ import logging
 
 from typing import Callable, Dict, List
 
-import unicorn as uc
+import zebracorn as uc
 
 from zelos.emulator import create_emulator
 from zelos.emulator.base import IEmuHelper
 from zelos.emulator.x86_gdt import GDT_32
 from zelos.exceptions import ZelosLoadException
+from zelos.file_system import FileSystem
 from zelos.handles import Handles
 from zelos.hooks import HookManager, Hooks, HookType, InterruptHooks
 from zelos.memory import Memory
@@ -50,11 +51,9 @@ class Process:
         main_module: str = None,
         orig_file_name: str = "",
         cmdline_args: List = None,
-        environment_variables: List = None,
+        environment_variables: Dict = None,
         virtual_filename: str = None,
         virtual_path: str = None,
-        last_instruction: str = None,
-        last_instruction_size: int = 0,
         disableNX: bool = False,
     ):
         # OS plugins place OS-specific, process-level, functionality
@@ -76,26 +75,28 @@ class Process:
         )
         self.cmdline_args = [] if cmdline_args is None else cmdline_args
         self.environment_variables = (
-            [] if environment_variables is None else environment_variables
+            {} if environment_variables is None else environment_variables
         )
         self.virtual_filename = virtual_filename
         self.virtual_path = virtual_path
         self.original_file_name = orig_file_name
-        self.last_instruction = last_instruction
-        self.last_instruction_size = last_instruction_size
 
         self.modules = Modules()
 
-        self.memory = Memory(self.emu, processes.state, disableNX=disableNX)
+        self.memory = Memory(
+            self.emu, hook_manager, processes.state, disableNX=disableNX
+        )
 
         self.threads = Threads(
-            self.emu, self.memory, self.processes.stack_size
+            self.emu, self.memory, self.processes.stack_size, hook_manager
         )
-        self.hooks = Hooks(self.emu, self.threads)
+        self.hooks = Hooks(self.emu, self.threads.scheduler)
 
     def __str__(self) -> str:
-        return f"Name: '{self.name}', pid: {self.pid:x}, "
-        f"Active threads: {self.threads.num_active_threads()}"
+        return (
+            f"Name: '{self.name}', pid: {self.pid:x}, "
+            f"Active threads: {self.threads.num_active_threads()}"
+        )
 
     @property
     def is_active(self) -> bool:
@@ -152,11 +153,11 @@ class Process:
         )
 
         current_thread = self.current_thread
-        self.threads.swap_with_thread(tid=t.id)
+        self.threads._swap_thread(t.id)
         for hook in self._hook_manager._get_hooks(HookType.THREAD.CREATE):
             hook(t, stack_setup)
         if current_thread is not None:
-            self.threads.swap_with_thread(tid=current_thread.id)
+            self.threads._swap_thread(current_thread.id)
         return t
 
     def get_thread(self, tid: int) -> Thread:
@@ -221,6 +222,7 @@ class Processes:
         self,
         hook_manager: HookManager,
         interrupt_handler: InterruptHooks,
+        file_system: FileSystem,
         main_module_name: str,
         thread_stack_size: int,
         disableNX: bool = False,
@@ -240,7 +242,7 @@ class Processes:
         # Counter to keep track of which process we are at.
         self.process_counter = 0
 
-        self.handles = Handles(self, hook_manager)
+        self.handles = Handles(self, hook_manager, file_system)
 
         def apply_cross_process_hooks(p):
             for hook in self._hook_manager._cross_process_hooks.values():
@@ -293,6 +295,8 @@ class Processes:
         parent_pid: int = None,
         main_module=None,
         cmdline_args: List = [],
+        virtual_filename: str = None,
+        virtual_path: str = None,
     ) -> int:
         """
         Creates a new process.
@@ -326,6 +330,8 @@ class Processes:
             main_module=main_module,
             cmdline_args=cmdline_args,
             disableNX=self.disableNX,
+            virtual_filename=virtual_filename,
+            virtual_path=virtual_path,
         )
 
         for hook in self._hook_manager._get_hooks(HookType.PROCESS.CREATE):
@@ -466,8 +472,6 @@ class Processes:
         """
         if self.current_process.is_active:
             self.current_process.threads.swap_with_next_thread()
-            for hook in self._hook_manager._get_hooks(HookType.THREAD.SWAP):
-                hook(self.current_thread)
         else:
             self.load_next_process()
 

@@ -13,14 +13,24 @@
 
 # <http://www.gnu.org/licenses/>.
 # ======================================================================
-from __future__ import absolute_import
-
 # You should have received a copy of the GNU Affero General Public
 # License along with this program.  If not, see
+
+
+from __future__ import absolute_import
+
+import io
+import tempfile
 import unittest
+
+from os import path
+from unittest.mock import patch
 
 from zelos import Zelos
 from zelos.handles import FileHandle
+
+
+DATA_DIR = path.join(path.dirname(path.abspath(__file__)), "data")
 
 
 class HandleTest(unittest.TestCase):
@@ -76,6 +86,46 @@ class HandleTest(unittest.TestCase):
 
         handles.add_handle(file1, handle_num=file_num1, pid=0x1000)
         self.assertIs(handles.get(file_num1, pid=0x1000), file1)
+
+    def test_truncate(self):
+        z = Zelos(None)
+        handles = z.internal_engine.handles
+
+        handle_num = handles.new_file(
+            "TestFile", file=tempfile.TemporaryFile("wb")
+        )
+        handle = handles.get(handle_num)
+
+        self.assertEqual(handle.size(), 0)
+        handle.truncate(0x100)
+        self.assertEqual(handle.size(), 0x100)
+
+    def test_stdin_redirect(self):
+        new_stdin = io.TextIOWrapper(
+            io.BufferedReader(io.BytesIO(b"test data"))
+        )
+        with patch("sys.stdin", new=new_stdin):
+            z = Zelos(path.join(DATA_DIR, "read_stdin"), trace_off=True)
+            with patch("sys.stdout", new=io.StringIO()) as stdout:
+                z.start()
+                self.assertIn("string is: test data", stdout.getvalue())
+
+    def test_issue_96(self):
+        # Zelos shouldn't close passed through stdin when cleaning up
+        # stdin handle
+        # Zelos shouldn't crash if stdin is closed before zelos is
+        # initialized.
+        new_stdin = io.TextIOWrapper(
+            io.BufferedReader(io.BytesIO(b"test data"))
+        )
+        with patch("sys.stdin", new=new_stdin):
+            z = Zelos(None)
+            stdin_handle = z.internal_engine.handles.get(0)
+            stdin_handle.cleanup()
+            self.assertFalse(new_stdin.closed)
+
+            new_stdin.close()
+            Zelos(None)
 
 
 def main():
